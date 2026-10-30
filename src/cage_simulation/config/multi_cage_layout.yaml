@@ -1,0 +1,8 @@
+multi_cage_layout:
+  active_cage_id: 0
+  cages:
+    - {id: 0, name: CAGE_0, targetable: true,  pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    - {id: 1, name: CAGE_1, targetable: false, pose: [-95.0, -150.0, 0.0, 0.0, 0.0, 0.22]}
+    - {id: 2, name: CAGE_2, targetable: false, pose: [130.0, 140.0, 0.0, 0.0, 0.0, -0.18]}
+    - {id: 3, name: CAGE_3, targetable: false, pose: [250.0, 0.0, 0.0, 0.0, 0.0, 0.12]}
+    - {id: 4, name: CAGE_4, targetable: false, pose: [40.0, -265.0, 0.0, 0.0, 0.0, -0.10]}

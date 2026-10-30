@@ -1,0 +1,22 @@
+vehicle:
+  fcu_url: "/dev/ttyUSB0:115200"
+  auto_arm: false
+  auto_mode: AUTO.MISSION
+  # The pilot, not NX, changes H12/CH5 to AUTO.MISSION after WAIT_ARM.
+  manual_auto_mode_switch: true
+  prearm_mode: STABILIZE
+  rtl_mode: AUTO.RTL
+  home_reference: stable_uav_gps
+  require_rc_ready: true
+  takeoff_relative_alt: 10.0
+  cruise_relative_alt: 10.0
+  feed_relative_alt: 5.0
+  # K9/ACFly currently reports POSCTL and ALTCTL on the H12 manual positions.
+  manual_modes: [STABILIZE, LOITER, POSHOLD, POSCTL, ALT_HOLD, ALTCTL, MANUAL]
+  mission_start_modes: [POSCTL, ALTCTL]
+  # Match the proven uav_bridge workflow: H12 E/CH5 right is the explicit
+  # permission for the NX to accept the pilot-selected AUTO.MISSION.
+  require_auto_permission_switch: true
+  auto_permission_channel_index: 4
+  auto_permission_threshold: 1650
+  auto_permission_rc_timeout: 1.0

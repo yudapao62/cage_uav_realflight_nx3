@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>cage_site_db</name>
+  <version>0.5.0</version>
+  <description>DATA_ONLY DJI GPS evidence, cage coordinate review, and PREVIEW_ONLY route service.</description>
+  <maintainer email="nx3@example.invalid">nx3</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <exec_depend>python3</exec_depend>
+</package>

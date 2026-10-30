@@ -1,0 +1,33 @@
+# Catkin outputs
+/build/
+/devel/
+/install/
+/logs/
+
+# Real-flight runtime data
+/bags/
+*.bag
+*.active
+*.log
+*.pid
+
+# Python and ROS caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ros/
+
+# Local databases and imported media
+*.db
+*.sqlite
+*.sqlite3
+/data/
+/uploads/
+
+# Editor and operating-system files
+.DS_Store
+._*
+*~
+*.swp
+*.bak*
+

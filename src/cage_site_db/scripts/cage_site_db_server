@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+import argparse
+from cage_site_db.service import run
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--bind", default="127.0.0.1")
+parser.add_argument("--port", type=int, default=8090)
+args = parser.parse_args()
+run(args.bind, args.port)

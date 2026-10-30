@@ -1,0 +1,36 @@
+cage:
+  geometry_mode: circular
+  circular:
+    feeding_dwell_sec: 10.0
+    # FSM opens the feeder for 10 s; FCU holds the final mission waypoint for
+    # 20 s so the FSM can close the feeder and request AUTO.RTL first.
+    fcu_feed_point_hold_sec: 20.0
+    target_acceptance_radius_m: 1.5
+    feeding_altitude_tolerance_m: 3.0
+    # K9/ACFly advances /mavros/mission/waypoints.current_seq but may not
+    # publish /mavros/mission/reached.  Allow a guarded, wider fallback only
+    # while armed in AUTO.MISSION with valid geometry and fresh UAV GPS.
+    current_seq_fallback_enabled: true
+    feeding_fallback_radius_m: 5.0
+    feeding_fallback_altitude_tolerance_m: 5.0
+
+feeding:
+  enabled: false
+
+ground_gps:
+  # Historical A/B data is about 1 Hz combined (about 0.5 Hz per anchor).
+  # Re-tune only after check_ground_gps_rate.sh records at least 60 seconds of
+  # real, sequence-advancing samples from both anchors.
+  min_rate_hz: 0.3
+  stale_timeout_sec: 3.5
+  stable_window_sec: 10.0
+  min_valid_samples: 3
+
+precheck:
+  gps_ok_hold_sec: 2.0
+  gps_fail_hold_sec: 2.0
+
+web:
+  enable_precheck_panel: true
+  enable_site_confirmation: true
+  enable_start_button: true

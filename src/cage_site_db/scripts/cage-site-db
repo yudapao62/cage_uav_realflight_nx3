@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from cage_site_db.cli import main
+
+raise SystemExit(main())

@@ -1,0 +1,18 @@
+feeding:
+  active_cage_id: 0
+  allow_other_cages: false
+  feed_relative_alt: 15.0
+  transit_relative_alt: 25.0
+  repeat_interval_sec: 3.0
+  max_repeat_count: 20
+  max_targets_per_mission: 200
+  feeder_mode: dry_run
+  require_real_feeder_for_start: true
+  pwm_output_channel: 9
+  pwm_on: 1841
+  pwm_off: 1137
+  command_update_rate_hz: 20.0
+  status_publish_rate_hz: 5.0
+  close_hold_sec: 1.0
+  max_run_duration_sec: 300.0
+  require_fcu_connection: true

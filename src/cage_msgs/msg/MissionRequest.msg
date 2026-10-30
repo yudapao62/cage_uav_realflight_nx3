@@ -1,0 +1,10 @@
+std_msgs/Header header
+string mission_id
+int32 target_cage_id
+bool start
+bool resume_after_override
+bool rtl_after_mission
+float64 feed_relative_alt
+float64 transit_relative_alt
+float64 takeoff_relative_alt
+float64 feeding_dwell_sec

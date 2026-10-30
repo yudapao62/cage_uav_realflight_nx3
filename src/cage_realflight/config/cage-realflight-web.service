@@ -1,0 +1,14 @@
+[Unit]
+Description=CAGE UAV always-on realflight web supervisor
+After=network.target
+
+[Service]
+Type=simple
+User=nx3
+Group=nx3
+ExecStart=/usr/bin/python3 /home/nx3/cage_uav_ws/src/cage_realflight/scripts/realflight_web_supervisor.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
