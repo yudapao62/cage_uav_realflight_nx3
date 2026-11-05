@@ -72,5 +72,12 @@ class PrestartModeTest(unittest.TestCase):
         self.assertFalse(module.Precheck._prestart_mode_ok(True, 'AUTO.MISSION', allowed))
         self.assertFalse(module.Precheck._prestart_mode_ok(False, 'POSCTL', allowed))
 
+    def test_input_profiles_are_strictly_isolated(self):
+        self.assertTrue(module.Precheck._profile_compatible('GROUND_GPS', 'GPS_CENTER'))
+        self.assertTrue(module.Precheck._profile_compatible('GROUND_GPS', 'GPS_GRID'))
+        self.assertTrue(module.Precheck._profile_compatible('PHOTO_COORDS', 'PHOTO_POINTS'))
+        self.assertFalse(module.Precheck._profile_compatible('PHOTO_COORDS', 'GPS_GRID'))
+        self.assertFalse(module.Precheck._profile_compatible('GROUND_GPS', 'PHOTO_POINTS'))
+
 
 if __name__ == '__main__': unittest.main()

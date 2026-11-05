@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import csv
-import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -13,117 +12,109 @@ os.environ["CAGE_SITE_DB_DATA"] = TEST_ROOT
 from PIL import Image
 from cage_site_db import config
 from cage_site_db.cli import backup_db
-from cage_site_db.db import init_db, now, row, rows, transaction, uid
-from cage_site_db.importers.csv_importer import import_csv
-from cage_site_db.importers.dji_txt_adapter import inspect_txt
+from cage_site_db.db import init_db, now, row, transaction, uid
+from cage_site_db.importers.coordinate_csv import import_coordinate_csv
 from cage_site_db.importers.exif_importer import import_photo
-from cage_site_db.processing.tracks import segment_samples
-from cage_site_db.service import create_route, route_csv, route_geojson, route_png
+from cage_site_db.migrations import migrate, pending_versions
 
 
 class CoreTests(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
-        init_db()
+    def setUpClass(cls): init_db()
 
     @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(TEST_ROOT, ignore_errors=True)
+    def tearDownClass(cls): shutil.rmtree(TEST_ROOT, ignore_errors=True)
+
+    def make_site(self, suffix):
+        site = uid("site")
+        with transaction() as conn:
+            conn.execute("INSERT INTO sites VALUES (?,?,?,?,?,?)",
+                         (site, "large-"+suffix, "CAGE_FARM", now(), "ACTIVE", None))
+        return site
+
+    def make_subcage(self, site, label):
+        cage = uid("subcage")
+        with transaction() as conn:
+            conn.execute("""INSERT INTO subcages
+                (id,site_id,label,row_index,col_index,notes,created_at,status)
+                VALUES (?,?,?,?,?,?,?,'ACTIVE')""",
+                (cage, site, label, None, None, None, now()))
+        return cage
 
     def make_jpeg(self, name):
         path = os.path.join(TEST_ROOT, name)
         Image.new("RGB", (64, 48), "navy").save(path, "JPEG")
         return path
 
-    def test_01_no_flight_control_imports(self):
+    def test_no_flight_control_imports(self):
         root = os.path.dirname(os.path.dirname(__file__))
-        forbidden = ("import rospy", "from rospy", "import mavros", "from mavros", "import cage_msgs", "from cage_msgs")
+        forbidden = ("import rospy", "from rospy", "import mavros", "from mavros",
+                     "import cage_msgs", "from cage_msgs")
         violations = []
         for base, _, files in os.walk(os.path.join(root, "cage_site_db")):
             for name in files:
                 if not name.endswith(".py"): continue
-                path = os.path.join(base, name)
-                with open(path, encoding="utf-8") as handle:
+                with open(os.path.join(base, name), encoding="utf-8") as handle:
                     text = handle.read().lower()
-                if any(token in text for token in forbidden): violations.append(path)
+                if any(token in text for token in forbidden): violations.append(name)
         self.assertEqual([], violations)
 
     @unittest.skipUnless(shutil.which("exiftool"), "ExifTool required")
-    def test_02_exif_no_gps_and_idempotency(self):
-        path = self.make_jpeg("no-gps.jpg")
-        first = import_photo(path, "no-gps.jpg", "CHAT_UPLOADED_COPY")
-        second = import_photo(path, "same-bytes.jpg", "CHAT_UPLOADED_COPY")
-        self.assertEqual("EXIF_NO_GPS", first["error_code"])
-        self.assertTrue(second["idempotent"])
-        with transaction() as conn:
-            self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM gps_samples WHERE source_asset_id=?", (first["id"],)).fetchone()[0])
-
-    @unittest.skipUnless(shutil.which("exiftool"), "ExifTool required")
-    def test_03_exif_gps_real_metadata(self):
+    def test_photo_xy_and_idempotency(self):
         path = self.make_jpeg("with-gps.jpg")
-        subprocess.run(["exiftool", "-overwrite_original", "-GPSLatitude=27.5825628333", "-GPSLatitudeRef=N",
-                        "-GPSLongitude=120.5662079722", "-GPSLongitudeRef=E",
-                        "-DateTimeOriginal=2026:10:27 13:57:43", path], check=True, stdout=subprocess.DEVNULL)
-        result = import_photo(path, "with-gps.jpg", "TEST_FIXTURE")
-        self.assertEqual("SUCCESS", result["import_status"])
-        self.assertAlmostEqual(27.5825628333, result["latitude"], places=7)
-        self.assertIn("EXIF_TIMEZONE_UNVERIFIED", result["quality_flags"])
-        self.assertIn("PHOTO_CENTER_PROXY_UNVERIFIED", result["quality_flags"])
+        subprocess.run(["exiftool", "-overwrite_original", "-GPSLatitude=27.5825628333",
+                        "-GPSLatitudeRef=N", "-GPSLongitude=120.5662079722",
+                        "-GPSLongitudeRef=E", "-GPSAltitude=888", path], check=True,
+                       stdout=subprocess.DEVNULL)
+        first = import_photo(path, "with-gps.jpg", "TEST")
+        second = import_photo(path, "same.jpg", "TEST")
+        self.assertEqual("SUCCESS", first["import_status"])
+        self.assertAlmostEqual(27.5825628333, first["latitude"], places=7)
+        self.assertTrue(second["idempotent"])
 
-    def test_04_csv_normalization_and_segmentation(self):
-        path = os.path.join(TEST_ROOT, "normalized.csv")
-        with open(path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle); writer.writerow(["sample_time_utc","latitude","longitude","gps_valid","source_sample_id"])
-            writer.writerow(["2026-10-27T04:00:00Z",30.0001,120.0001,"true","a"])
-            writer.writerow(["2026-10-27T04:00:00.2Z",30.000101,120.000101,"true","b"])
-            writer.writerow(["2026-10-27T04:00:12.7Z",30.0005,120.0005,"true","c"])
-        result = import_csv(path, "normalized.csv")
-        self.assertEqual(3, result["valid_rows"])
-        self.assertEqual(2, result["segments"])
-
-    def test_05_raw_txt_detection(self):
-        fake = os.path.join(TEST_ROOT, "DJIFlightRecord_fake.txt")
-        with open(fake, "wb") as handle:
-            handle.write(b"sample_time_utc,latitude,longitude\n")
-        self.assertEqual("DJI_TXT_INVALID_FORMAT", inspect_txt(fake)["error_code"])
-        encrypted = os.path.join(TEST_ROOT, "DJIFlightRecord_v13.txt")
-        payload = bytearray(512); payload[10] = 13
-        with open(encrypted, "wb") as handle:
-            handle.write(payload)
-        result = inspect_txt(encrypted)
-        self.assertEqual(13, result["version"])
-        self.assertIn(result.get("error_code"), ("DJI_TXT_DECRYPTION_KEY_REQUIRED", "DJI_TXT_PARSER_NOT_INSTALLED"))
-
-    def test_06_track_reverse_duplicate_and_jump(self):
-        samples = [
-            {"id":"a","sample_index":0,"timestamp_utc":"2026-10-27T04:00:00+00:00","latitude":30.0,"longitude":120.0,"gps_valid":True},
-            {"id":"b","sample_index":1,"timestamp_utc":"2026-10-27T04:00:00+00:00","latitude":30.0,"longitude":120.0,"gps_valid":True},
-            {"id":"c","sample_index":2,"timestamp_utc":"2026-10-27T04:00:01+00:00","latitude":31.0,"longitude":121.0,"gps_valid":True},
-        ]
-        segments, diagnostics = segment_samples(samples)
-        self.assertGreaterEqual(len(segments), 2)
-        reasons = {item["reason"] for item in diagnostics}
-        self.assertIn("DUPLICATE_SAMPLE", reasons)
-        self.assertIn("DIAGNOSTIC_SPEED_JUMP", reasons)
-
-    def test_07_review_and_route_exports_never_flight_eligible(self):
+    def test_coordinate_csv_200_rows_pending_and_line_errors(self):
+        site = self.make_site("csv")
+        for index in range(1, 201): self.make_subcage(site, "A-%03d" % index)
+        lines = ["small_cage_label,latitude,longitude,row_index,col_index,note"]
+        lines += ["A-%03d,27.%08d,120.%08d,1,%d,test" %
+                  (index, 58000000+index, 56000000+index, index)
+                  for index in range(1, 201)]
+        lines.append("MISSING,999,999,,,")
+        result = import_coordinate_csv("\n".join(lines).encode("utf-8"), site)
+        self.assertEqual(200, result["succeeded"])
+        self.assertEqual(1, result["failed"])
         with transaction() as conn:
-            site=uid("site"); cage=uid("subcage"); candidate=uid("candidate"); approved=uid("approved")
-            conn.execute("INSERT INTO sites VALUES (?,?,?,?,?,?)",(site,"route-test","TEST",now(),"ACTIVE",None))
-            conn.execute("INSERT INTO subcages VALUES (?,?,?,?,?,?,?)",(cage,site,"C-01",None,None,None,now()))
-            conn.execute("INSERT INTO candidate_points VALUES (?,?,?,?,?,?,?,?,?)",(candidate,cage,"TEST_EVIDENCE",27.58,120.56,"[]","TEST_REAL_STRUCTURE","APPROVED",now()))
-            conn.execute("INSERT INTO approved_point_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)",(approved,cage,candidate,1,27.58,120.56,"{}","tester","unit test",now(),1))
-        route = create_route({"site_id":site,"subcage_ids":[cage],"home":{"lat":27.579,"lon":120.559},"include_return":True})
-        self.assertTrue(route["preview_only"])
-        self.assertFalse(route["realflight_eligible"])
-        self.assertIn(b"realflight_eligible=false", route_csv(route))
-        self.assertFalse(json.loads(route_geojson(route))["features"][0]["properties"]["realflight_eligible"])
-        self.assertTrue(route_png(route).startswith(b"\x89PNG"))
+            self.assertEqual(200, conn.execute("SELECT COUNT(*) FROM candidate_points WHERE calculation_method='MANUAL_WGS84_CSV' AND status='PENDING'").fetchone()[0])
 
-    def test_08_sqlite_backup_integrity(self):
+    def test_manual_candidate_version_history(self):
+        site = self.make_site("manual"); cage = self.make_subcage(site, "M-001")
+        with transaction() as conn:
+            for version in (1, 2):
+                candidate = uid("candidate")
+                conn.execute("INSERT INTO candidate_points VALUES (?,?,?,?,?,?,?,?,?)",
+                             (candidate, cage, "MANUAL_WGS84", 27.58+version/10000.0,
+                              120.56, "{}", "USER_REVIEW_REQUIRED", "APPROVED", now()))
+                conn.execute("UPDATE approved_point_versions SET active=0 WHERE subcage_id=?", (cage,))
+                conn.execute("INSERT INTO approved_point_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                             (uid("approved"), cage, candidate, version, 27.58+version/10000.0,
+                              120.56, "{}", "tester", "review", now(), 1))
+            versions = conn.execute("SELECT version,active FROM approved_point_versions WHERE subcage_id=? ORDER BY version", (cage,)).fetchall()
+        self.assertEqual([(1, 0), (2, 1)], [tuple(item) for item in versions])
+
+    def test_legacy_schema_migrates_without_dropping_tracks(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""CREATE TABLE subcages(id TEXT PRIMARY KEY,site_id TEXT,label TEXT,row_index INTEGER,col_index INTEGER,notes TEXT,created_at TEXT);
+            CREATE TABLE track_segments(id TEXT PRIMARY KEY); INSERT INTO track_segments VALUES ('legacy');""")
+        pending = pending_versions(conn); migrate(conn, pending)
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(subcages)")}
+        self.assertIn("status", columns)
+        self.assertEqual("legacy", conn.execute("SELECT id FROM track_segments").fetchone()[0])
+        self.assertTrue(conn.execute("SELECT name FROM sqlite_master WHERE name='mission_snapshots'").fetchone())
+        conn.close()
+
+    def test_sqlite_backup_integrity(self):
         result = backup_db(os.path.join(TEST_ROOT, "backup.sqlite"))
         self.assertEqual("ok", result["integrity_check"])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+if __name__ == "__main__": unittest.main(verbosity=2)

@@ -8,7 +8,11 @@ CREATE TABLE IF NOT EXISTS sites (
 CREATE TABLE IF NOT EXISTS subcages (
   id TEXT PRIMARY KEY, site_id TEXT NOT NULL REFERENCES sites(id), label TEXT NOT NULL,
   row_index INTEGER, col_index INTEGER, notes TEXT, created_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
   UNIQUE(site_id,label)
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS capture_sessions (
   id TEXT PRIMARY KEY, site_id TEXT REFERENCES sites(id), device TEXT,
@@ -79,6 +83,25 @@ CREATE TABLE IF NOT EXISTS route_preview_points (
   lat REAL NOT NULL, lon REAL NOT NULL, segment_distance_m REAL NOT NULL,
   approved_version_id TEXT, PRIMARY KEY(route_id,seq)
 );
+CREATE TABLE IF NOT EXISTS mission_snapshots (
+  id TEXT PRIMARY KEY, mission_id TEXT NOT NULL UNIQUE,
+  input_profile TEXT NOT NULL, site_id TEXT REFERENCES sites(id),
+  home_lat REAL NOT NULL, home_lon REAL NOT NULL, home_alt REAL,
+  takeoff_relative_alt REAL NOT NULL, transit_relative_alt REAL NOT NULL,
+  feed_relative_alt REAL NOT NULL, feeding_dwell_sec REAL NOT NULL,
+  waypoint_hold_sec REAL NOT NULL, speed REAL NOT NULL,
+  acceptance_radius REAL NOT NULL, preview_hash TEXT NOT NULL,
+  state TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mission_snapshot_targets (
+  snapshot_id TEXT NOT NULL REFERENCES mission_snapshots(id), seq INTEGER NOT NULL,
+  subcage_id TEXT REFERENCES subcages(id), approved_version_id TEXT,
+  label TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+  PRIMARY KEY(snapshot_id,seq)
+);
 CREATE INDEX IF NOT EXISTS idx_samples_asset ON gps_samples(source_asset_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_subcage ON candidate_points(subcage_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_session ON track_segments(session_id);
+CREATE INDEX IF NOT EXISTS idx_subcages_site_status ON subcages(site_id,status,label);
+CREATE INDEX IF NOT EXISTS idx_mission_snapshots_site ON mission_snapshots(site_id,created_at);

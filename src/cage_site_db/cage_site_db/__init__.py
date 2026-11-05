@@ -1,4 +1,4 @@
-"""Offline DJI GPS evidence and cage route preview package."""
+"""Large/small cage photo and manual WGS84 review database."""
 
-__version__ = "0.5.0"
-SAFETY_MODE = "DATA_ONLY/PREVIEW_ONLY"
+__version__ = "0.6.0"
+SAFETY_MODE = "DATA_ONLY"

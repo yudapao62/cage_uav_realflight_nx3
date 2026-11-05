@@ -12,6 +12,20 @@ from cage_geo.geodesy import LocalENU
 TASK_SOURCES = ("GPS_CENTER", "GPS_GRID", "PHOTO_POINTS")
 
 
+def battery_status(percentage, voltage, received_at, now, timeout, threshold):
+    """Normalize MAVROS telemetry without inventing a percentage from voltage."""
+    age = max(0.0, float(now)-float(received_at)) if received_at else None
+    percentage = (float(percentage) if percentage is not None and
+                  math.isfinite(float(percentage)) and 0.0 <= float(percentage) <= 1.0
+                  else None)
+    voltage = (float(voltage) if voltage is not None and math.isfinite(float(voltage)) and
+               float(voltage) > 0.0 else None)
+    return {"percentage": percentage, "voltage": voltage,
+            "fresh": age is not None and age <= float(timeout), "age_sec": age,
+            "low": percentage is not None and percentage <= float(threshold),
+            "threshold": float(threshold)}
+
+
 def _finite(value, name):
     value = float(value)
     if not math.isfinite(value):
@@ -160,8 +174,8 @@ def plan_gps_grid(home, endpoint_a, endpoint_b, rows, cols,
 
 def plan_photo_points(home, approved_points, takeoff_alt, transit_alt, feed_alt,
                       dwell, radius=3.0, speed=5.0,
-                      max_leg_distance=5000.0):
-    """Plan approved photo-derived XY points in greedy nearest-neighbour order."""
+                      max_leg_distance=5000.0, preserve_order=False):
+    """Plan approved database XY points; altitude always comes from Web parameters."""
     home_coord, _ = _common(home, takeoff_alt, transit_alt, feed_alt, dwell,
                             radius, speed, max_leg_distance)
     local = LocalENU(*home_coord)
@@ -173,14 +187,17 @@ def plan_photo_points(home, approved_points, takeoff_alt, transit_alt, feed_alt,
                           "cell_id": str(point.get("label") or point.get("id") or "PHOTO-{:03d}".format(index + 1)),
                           "approved_version_id": str(point.get("id") or "")})
     ordered, x, y = [], 0.0, 0.0
-    while remaining:
-        index = min(range(len(remaining)),
-                    key=lambda i: (math.hypot(remaining[i]["x"] - x,
-                                              remaining[i]["y"] - y),
-                                   remaining[i]["cell_id"]))
-        point = remaining.pop(index)
-        ordered.append(point)
-        x, y = point["x"], point["y"]
+    if preserve_order:
+        ordered = remaining
+    else:
+        while remaining:
+            index = min(range(len(remaining)),
+                        key=lambda i: (math.hypot(remaining[i]["x"] - x,
+                                                  remaining[i]["y"] - y),
+                                       remaining[i]["cell_id"]))
+            point = remaining.pop(index)
+            ordered.append(point)
+            x, y = point["x"], point["y"]
     mission = _grid_mission(home_coord, ordered, takeoff_alt, transit_alt,
                             feed_alt, dwell, radius, speed, max_leg_distance)
     return mission, {"target_count": len(ordered),
@@ -188,4 +205,5 @@ def plan_photo_points(home, approved_points, takeoff_alt, transit_alt, feed_alt,
                                 "label": p["cell_id"], "lat": p["lat"],
                                 "lon": p["lon"]} for p in ordered],
                      "altitude_source": "WEB_PARAMETER_RELATIVE_ALT",
-                     "photo_altitude_ignored": True}
+                     "photo_altitude_ignored": True,
+                     "order_mode": "MANUAL" if preserve_order else "NEAREST"}

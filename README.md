@@ -8,7 +8,9 @@
 
 - 双地面 GPS 中点投喂任务；
 - A/B 作为矩形对角点的 N×M 网格中心航点和蛇形遍历；
-- DJI 照片 GPS 点任务，只采用经纬度，高度由网页参数设置；
+- 初始化前强制选择 `GROUND_GPS`（双地面 GPS A/B）或 `PHOTO_COORDS`（照片/人工坐标）；
+- 多大网箱数据库，每个大网箱支持 1～200 个小网箱、照片 EXIF、人工经纬度、坐标 CSV 和审核版本；
+- 照片/人工坐标只采用经纬度，高度由网页参数设置；
 - 网页完成启动、自检、现场确认、预览、提交、录包和停止系统；
 - H12 手动切换 `AUTO.MISSION`，CH5/E 右侧门控；
 - PWM9 投喂器定时开关；
@@ -16,6 +18,7 @@
 - 最后网格点结束后由状态机请求 `AUTO.RTL`，不再添加同坐标的 `GRID_EXIT`；
 - 飞控任务上传前清除残留任务，上传后回读校验数量；
 - 手动接管、GPS/FCU/投喂器检查和失败阻断。
+- 网页实时显示飞控电量，并提供任意时刻可用的 `RETURN / 立即返航`；H12 接管优先级最高。
 
 ## 工作区准备
 
@@ -35,16 +38,18 @@ NX3 还需要已安装并可用的外部工作区：
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source ~/gps_ws/devel/setup.bash
 source ~/acfly_ws/devel/setup.bash
 source ~/cage_uav_ws/devel/setup.bash
 
 rosrun cage_realflight start_realflight_stack.sh \
+  --input-profile photo_coords \
   --geometry circular \
   --feeding true \
   --rviz true \
   --web true
 ```
+
+使用双地面 GPS 时改为 `--input-profile ground_gps`，并额外加载 `~/gps_ws/devel/setup.bash`。网页监督器会在每次启动前要求重新选择，运行期间不能热切换。
 
 启动后访问 NX3 的 `8080` 端口，例如：
 
@@ -71,6 +76,7 @@ catkin_test_results build/test_results
 
 详细流程见：
 
+- `src/cage_realflight/PHOTO_COORDS_WEB_WORKFLOW.md`
 - `src/cage_realflight/WEB_FULL_SYSTEM_TEST.md`
 - `src/cage_realflight/THREE_MODE_WEB_TASKS_2026-10-30.md`
 - `src/cage_realflight/REALFLIGHT_EXPERIMENT_QUICKSTART.md`

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import hashlib
 import json
 import math
 import os
@@ -9,20 +10,21 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rospy
 from mavros_msgs.msg import State, WaypointList
-from sensor_msgs.msg import NavSatFix, NavSatStatus
+from sensor_msgs.msg import BatteryState, NavSatFix, NavSatStatus
 from std_msgs.msg import Empty, Float64, Header, String
 from cage_msgs.msg import (CageGeometry, FeedingTaskRequest, FeedingTaskStatus,
                            MissionRequest, MissionState, MissionWaypoint,
                            MissionWaypointArray)
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from mission_modes import TASK_SOURCES, plan_gps_grid, plan_photo_points
+from mission_modes import TASK_SOURCES, battery_status, plan_gps_grid, plan_photo_points
 
 
 class BagRecorder:
@@ -122,17 +124,22 @@ class BagRecorder:
 
 
 class WebBridge:
-    CONFIRMATION_KEYS = ('anchors_fixed', 'takeoff_area_clear', 'h12_takeover_verified',
-                         'pilot_ready', 'site_coordinates_verified')
+    COMMON_CONFIRMATION_KEYS = ('takeoff_area_clear', 'h12_takeover_verified',
+                                'pilot_ready', 'site_coordinates_verified')
 
     def __init__(self):
         self.geometry_mode = str(rospy.get_param('/cage/geometry_mode', 'rectangular')).strip().lower()
         if self.geometry_mode not in ('rectangular', 'circular'):
             raise ValueError('invalid /cage/geometry_mode: {}'.format(self.geometry_mode))
         self.status = FeedingTaskStatus(task_state='TASK_IDLE')
+        self.input_profile = str(rospy.get_param('/realflight/input_profile', '')).upper()
+        if self.input_profile not in ('GROUND_GPS', 'PHOTO_COORDS'):
+            raise ValueError('invalid /realflight/input_profile')
         self.mission = MissionState(state='WAIT_FCU')
         self.fcu = State()
         self.uav_gps = None
+        self.battery = None; self.battery_received_at = 0.0
+        self.return_control = {'state': 'IDLE', 'reason': '', 'requested_at': None, 'attempts': 0}
         self.relative_alt = None
         self.beacon = {}; self.precheck = {}; self.geometry = None
         self.waypoints = None
@@ -156,17 +163,27 @@ class WebBridge:
         self.preview_pub = rospy.Publisher('/feeding/task_preview', FeedingTaskRequest, queue_size=1)
         self.start_pub = rospy.Publisher('/feeding/task_request', FeedingTaskRequest, queue_size=1)
         self.cancel_pub = rospy.Publisher('/feeding/task_cancel', Empty, queue_size=1)
+        self.return_pub = rospy.Publisher('/mission/return_now', Empty, queue_size=1)
         rospy.Subscriber('/feeding/task_status', FeedingTaskStatus, lambda m: setattr(self, 'status', m), queue_size=1)
-        rospy.Subscriber('/mission/state', MissionState, lambda m: setattr(self, 'mission', m), queue_size=1)
+        rospy.Subscriber('/mission/state', MissionState, self.on_mission, queue_size=1)
         rospy.Subscriber('/mission/waypoints', MissionWaypointArray, self.on_waypoints, queue_size=1)
         rospy.Subscriber('/mavros/state', State, lambda m: setattr(self, 'fcu', m), queue_size=1)
         rospy.Subscriber('/mavros/mission/waypoints', WaypointList,
                          lambda m: setattr(self, 'fcu_waypoints', m), queue_size=1)
         rospy.Subscriber('/mavros/global_position/global', NavSatFix, lambda m: setattr(self, 'uav_gps', m), queue_size=1)
         rospy.Subscriber('/mavros/global_position/rel_alt', Float64, lambda m: setattr(self, 'relative_alt', m.data), queue_size=1)
+        rospy.Subscriber('/mavros/battery', BatteryState, self.on_battery, queue_size=1)
+        rospy.Subscriber('/mission/return_status', String, self.on_return_status, queue_size=1)
         rospy.Subscriber('/cage/beacon/status', String, self.on_beacon, queue_size=1)
         rospy.Subscriber('/cage/realflight/precheck', String, self.on_precheck, queue_size=1)
         rospy.Subscriber('/cage/geometry', CageGeometry, lambda m: setattr(self, 'geometry', m), queue_size=1)
+
+    def on_battery(self, msg):
+        self.battery = msg; self.battery_received_at = time.time()
+
+    def on_return_status(self, msg):
+        try: self.return_control = json.loads(msg.data)
+        except ValueError: self.return_control = {'state': 'FAILED', 'reason': 'RETURN_STATUS_INVALID', 'requested_at': None, 'attempts': 0}
 
     def on_beacon(self, msg):
         try: self.beacon = json.loads(msg.data)
@@ -175,6 +192,15 @@ class WebBridge:
     def on_precheck(self, msg):
         try: self.precheck = json.loads(msg.data)
         except ValueError: self.precheck = {}
+
+    def on_mission(self, msg):
+        changed = msg.state != self.mission.state or msg.reason != self.mission.reason
+        self.mission = msg
+        if changed and self.input_profile == 'PHOTO_COORDS' and self.frozen_preview_payload:
+            threading.Thread(target=self.update_snapshot,
+                args=(msg.state, {'reason': msg.reason, 'current_waypoint': msg.current_waypoint,
+                                  'current_cell_id': msg.current_cell_id,
+                                  'battery': self.battery_json()}), daemon=True).start()
 
     def on_waypoints(self, msg):
         self.waypoints = msg
@@ -266,25 +292,36 @@ class WebBridge:
             'feed_relative_alt': rospy.get_param('/feeding/feed_relative_alt', 5.0),
             'feeding_dwell_sec': rospy.get_param('/cage/circular/feeding_dwell_sec', 10.0),
             'waypoint_hold_sec': rospy.get_param('/mission/grid_waypoint_hold_sec', 10.0),
-            'grid_rows': 6, 'grid_cols': 10,
-            'photo_point_ids': []}
+            'grid_rows': 6, 'grid_cols': 10, 'large_cage_id': '',
+            'route_order_mode': 'NEAREST', 'photo_point_ids': [],
+            'speed': rospy.get_param('/mission/speed', 5.0),
+            'acceptance_radius': rospy.get_param('/mission/waypoint_acceptance_radius', 3.0),
+            'max_leg_distance': rospy.get_param('/safety/max_leg_distance', 5000.0)}
         out = {key: payload.get(key, value) for key, value in defaults.items()}
         out['task_id'] = str(out['task_id']).strip()[:64]
         out['task_source'] = str(out['task_source']).strip().upper()
         out['cage_id'] = int(out['cage_id']); out['repeat_count'] = int(out['repeat_count'])
         for key in ('takeoff_relative_alt', 'transit_relative_alt', 'feed_relative_alt',
-                    'feeding_dwell_sec', 'waypoint_hold_sec'):
+                    'feeding_dwell_sec', 'waypoint_hold_sec', 'speed',
+                    'acceptance_radius', 'max_leg_distance'):
             out[key] = float(out[key])
         if not out['task_id'] or not 1 <= out['repeat_count'] <= 20:
             raise ValueError('invalid task id or repeat count')
         if out['task_source'] not in TASK_SOURCES:
             raise ValueError('task_source must be GPS_CENTER, GPS_GRID or PHOTO_POINTS')
+        compatible = ((self.input_profile == 'GROUND_GPS' and out['task_source'] in ('GPS_CENTER','GPS_GRID')) or
+                      (self.input_profile == 'PHOTO_COORDS' and out['task_source'] == 'PHOTO_POINTS'))
+        if not compatible:
+            raise ValueError('INPUT_PROFILE_TASK_SOURCE_MISMATCH')
         for key in ('takeoff_relative_alt', 'transit_relative_alt', 'feed_relative_alt'):
             if not 3.0 <= out[key] <= 120.0: raise ValueError(key+' must be 3..120 m')
         if not 1.0 <= out['feeding_dwell_sec'] <= 120.0:
             raise ValueError('feeding_dwell_sec must be 1..120 s')
         if not 2.0 <= out['waypoint_hold_sec'] <= 300.0:
             raise ValueError('waypoint_hold_sec must be 2..300 s')
+        if not 0.5 <= out['speed'] <= 20.0: raise ValueError('speed must be 0.5..20 m/s')
+        if not 0.5 <= out['acceptance_radius'] <= 30.0: raise ValueError('acceptance_radius must be 0.5..30 m')
+        if not 10.0 <= out['max_leg_distance'] <= 20000.0: raise ValueError('max_leg_distance must be 10..20000 m')
         if (out['task_source'] in ('GPS_GRID', 'PHOTO_POINTS') and
                 out['feeding_dwell_sec'] >= out['waypoint_hold_sec']):
             raise ValueError('feeding duration must be shorter than waypoint hold time')
@@ -297,8 +334,13 @@ class WebBridge:
         if not isinstance(ids, list):
             raise ValueError('photo_point_ids must be a list')
         out['photo_point_ids'] = [str(value) for value in ids]
-        if out['task_source'] == 'PHOTO_POINTS' and not out['photo_point_ids']:
-            raise ValueError('select at least one approved photo point')
+        out['large_cage_id'] = str(out.get('large_cage_id') or '')
+        out['route_order_mode'] = str(out.get('route_order_mode') or 'NEAREST').upper()
+        if out['route_order_mode'] not in ('NEAREST','MANUAL'):
+            raise ValueError('route_order_mode must be NEAREST or MANUAL')
+        if out['task_source'] == 'PHOTO_POINTS':
+            if not out['large_cage_id']: raise ValueError('select one large cage')
+            if not out['photo_point_ids']: raise ValueError('select at least one approved database point')
         return out
 
     def make_request(self, payload, auto_start):
@@ -318,18 +360,74 @@ class WebBridge:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return json.loads(response.read().decode('utf-8'))
 
+    @staticmethod
+    def _post_json(url, payload, timeout=3.0):
+        request = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'),
+                                         headers={'Content-Type': 'application/json'}, method='POST')
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode('utf-8'))
+
+    def large_cages(self):
+        try:
+            return [item for item in self._json_url('http://127.0.0.1:8090/api/site-db/sites')
+                    if item.get('status') == 'ACTIVE']
+        except Exception as exc:
+            rospy.logwarn_throttle(10.0, 'Large cage database unavailable: %s', exc)
+            return []
+
     def approved_photo_points(self):
         try:
             data = self._json_url('http://127.0.0.1:8090/api/site-db/map')
             points = data.get('approved', [])
             return [{'id': str(point['id']), 'label': str(point.get('label') or point['id']),
                      'lat': float(point['lat']), 'lon': float(point['lon']),
+                     'site_id': str(point.get('site_id') or ''),
+                     'subcage_id': str(point.get('subcage_id') or ''),
+                     'source_method': str(point.get('source_method') or ''),
                      'version': int(point.get('version', 0)),
                      'approved_at': point.get('approved_at', '')}
                     for point in points if point.get('active', 1)]
         except Exception as exc:
             rospy.logwarn_throttle(10.0, 'Photo point database unavailable: %s', exc)
             return []
+
+    def save_snapshot(self):
+        if self.input_profile != 'PHOTO_COORDS':
+            return None
+        data = self.frozen_preview_payload
+        points = {item['id']: item for item in self.approved_photo_points()}
+        execution_ids = [item['approved_version_id'] for item in self.preview_details.get('order', [])]
+        selected = [points[item] for item in execution_ids if item in points]
+        if len(selected) != len(data['photo_point_ids']):
+            raise ValueError('APPROVED_POINT_VERSION_CHANGED')
+        home = self.preview_details['home']
+        digest = hashlib.sha256(json.dumps({'payload': data, 'plan': self.frozen_direct_plan},
+            sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
+        return self._post_json('http://127.0.0.1:8090/api/site-db/mission-snapshots', {
+            'mission_id': data['task_id'], 'input_profile': self.input_profile,
+            'site_id': data['large_cage_id'],
+            'home': home,
+            'parameters': data, 'preview_hash': digest, 'state': 'PREVIEW_CONFIRMED',
+            'details': self.preview_details,
+            'targets': [{'subcage_id': point['subcage_id'], 'approved_version_id': point['id'],
+                         'label': point['label'], 'lat': point['lat'], 'lon': point['lon']}
+                        for point in selected]})
+
+    def verify_frozen_versions(self):
+        if self.input_profile != 'PHOTO_COORDS': return True
+        current = {item['id']: item for item in self.approved_photo_points()}
+        return all(point_id in current and current[point_id]['site_id'] == self.frozen_preview_payload['large_cage_id']
+                   for point_id in self.frozen_preview_payload['photo_point_ids'])
+
+    def update_snapshot(self, state, details=None):
+        if self.input_profile != 'PHOTO_COORDS' or not self.frozen_preview_payload:
+            return
+        mission_id = urllib.parse.quote(self.frozen_preview_payload['task_id'], safe='')
+        try:
+            self._post_json('http://127.0.0.1:8090/api/site-db/mission-snapshots/{}/state'.format(mission_id),
+                            {'state': state, 'details': details or {}})
+        except Exception as exc:
+            rospy.logwarn('Mission snapshot state update failed: %s', exc)
 
     def _home(self):
         if (self.uav_gps is None or self.uav_gps.status.status < NavSatStatus.STATUS_FIX or
@@ -339,17 +437,11 @@ class WebBridge:
             raise ValueError('UAV_GPS_NOT_VALID')
         return (self.uav_gps.latitude, self.uav_gps.longitude, self.uav_gps.altitude)
 
-    def _planner_limits(self):
-        return (float(rospy.get_param('/mission/waypoint_acceptance_radius', 3.0)),
-                float(rospy.get_param('/mission/speed', 5.0)),
-                float(rospy.get_param('/safety/max_leg_distance', 5000.0)))
-
     def build_direct_plan(self, data):
         home = self._home()
-        radius, speed, max_leg = self._planner_limits()
         common = (data['takeoff_relative_alt'], data['transit_relative_alt'],
                   data['feed_relative_alt'], data['waypoint_hold_sec'],
-                  radius, speed, max_leg)
+                  data['acceptance_radius'], data['speed'], data['max_leg_distance'])
         if data['task_source'] == 'GPS_GRID':
             if self.geometry is None or not self.beacon.get('geometry_valid', False):
                 raise ValueError('BEACON_GEOMETRY_INVALID')
@@ -358,12 +450,17 @@ class WebBridge:
                 (self.geometry.endpoint_b_lat, self.geometry.endpoint_b_lon, self.geometry.endpoint_b_alt),
                 data['grid_rows'], data['grid_cols'], *common)
         elif data['task_source'] == 'PHOTO_POINTS':
-            approved = {point['id']: point for point in self.approved_photo_points()}
+            approved = {point['id']: point for point in self.approved_photo_points()
+                        if point['site_id'] == data['large_cage_id']}
             missing = [point_id for point_id in data['photo_point_ids'] if point_id not in approved]
             if missing:
                 raise ValueError('APPROVED_PHOTO_POINTS_REQUIRED:'+','.join(missing))
             selected = [approved[point_id] for point_id in data['photo_point_ids']]
-            plan, details = plan_photo_points(home, selected, *common)
+            plan, details = plan_photo_points(home, selected, *common,
+                preserve_order=data['route_order_mode'] == 'MANUAL')
+            details['large_cage_id'] = data['large_cage_id']
+            details['selected_versions'] = [{'id': p['id'], 'subcage_id': p['subcage_id'],
+                                              'version': p['version']} for p in selected]
         else:
             raise ValueError('direct planner only supports GPS_GRID and PHOTO_POINTS')
         if data['repeat_count'] > 1:
@@ -384,6 +481,7 @@ class WebBridge:
             details['target_count'] = len(cells)*data['repeat_count']
         details['waypoint_hold_sec'] = data['waypoint_hold_sec']
         details['feeding_duration_sec'] = data['feeding_dwell_sec']
+        details['home'] = {'lat': home[0], 'lon': home[1], 'alt': home[2]}
         return plan, details
 
     @staticmethod
@@ -434,7 +532,17 @@ class WebBridge:
         if not rospy.get_param('/realflight/site_alignment_confirmed', False): blockers.append('SITE_ALIGNMENT_NOT_CONFIRMED')
         if not self.preview_confirmed: blockers.append('PREVIEW_NOT_CONFIRMED')
         if not self.bag.status()['active']: blockers.append('ROSBAG_NOT_RECORDING')
+        if self.preview_payload:
+            try: self.normalized_payload(self.preview_payload)
+            except ValueError: blockers.append('INPUT_PROFILE_TASK_SOURCE_MISMATCH')
         return sorted(set(blockers))
+
+    def battery_json(self):
+        timeout = float(rospy.get_param('/safety/battery_telemetry_timeout_sec', 3.0))
+        threshold = float(rospy.get_param('/safety/low_battery_threshold', 0.20))
+        return battery_status(None if self.battery is None else self.battery.percentage,
+                              None if self.battery is None else self.battery.voltage,
+                              self.battery_received_at, time.time(), timeout, threshold)
 
     def waypoint_json(self):
         if self.waypoints is None: return []
@@ -463,6 +571,7 @@ class WebBridge:
                             'relative_alt': self.relative_alt}
         submission = self.submission_status()
         return {'geometry_mode': self.geometry_mode, 'task_source': task_source,
+            'input_profile': self.input_profile,
             'task_mode': 'CENTER_DWELL' if task_source == 'GPS_CENTER' else task_source,
             'feeding_enabled': bool(rospy.get_param('/feeding/enabled', True)), 'feeding_target': target,
             'center_dwell_sec': rospy.get_param('/cage/circular/feeding_dwell_sec', 5.0),
@@ -479,7 +588,8 @@ class WebBridge:
             'preview_confirmed': self.preview_confirmed, 'preview_pending': self.preview_pending,
             'preview_parameters': self.preview_payload, 'preview_waypoints': self.waypoint_json(),
             'preview_details': self.preview_details, 'uav_position': uav_position,
-            'submission': submission,
+            'submission': submission, 'battery': self.battery_json(),
+            'return_control': self.return_control,
             'mission_progress': {'current_waypoint': progress_index,
                 'completed_waypoints': completed, 'total_waypoints': len(waypoints),
                 'current_cell_id': self.mission.current_cell_id,
@@ -498,7 +608,9 @@ class WebBridge:
                 'cell_ids': ['R{:02d}C{:02d}'.format(r, c) for r in range(1, rows+1) for c in range(1, cols+1)]}
 
     def confirm_site(self, payload):
-        missing = [key for key in self.CONFIRMATION_KEYS if payload.get(key) is not True]
+        required = list(self.COMMON_CONFIRMATION_KEYS)
+        required.append('anchors_fixed' if self.input_profile == 'GROUND_GPS' else 'database_points_verified')
+        missing = [key for key in required if payload.get(key) is not True]
         if missing: return False, missing
         rospy.set_param('/realflight/site_alignment_confirmed', True)
         return True, []
@@ -513,16 +625,22 @@ def handler_factory(bridge, web_root):
             self.end_headers(); self.wfile.write(body)
 
         def do_GET(self):
-            if self.path == '/api/status': return self.send_json(bridge.status_json())
-            if self.path == '/api/grid': return self.send_json(bridge.grid_json())
-            if self.path == '/api/task-sources/photo-points':
-                points = bridge.approved_photo_points()
-                return self.send_json({'points': points, 'mode': 'APPROVED_POINTS_ONLY',
+            parsed = urllib.parse.urlparse(self.path); path = parsed.path
+            query = urllib.parse.parse_qs(parsed.query)
+            if path == '/api/status': return self.send_json(bridge.status_json())
+            if path == '/api/grid': return self.send_json(bridge.grid_json())
+            if path == '/api/task-sources/large-cages':
+                return self.send_json({'large_cages': bridge.large_cages(), 'input_profile': bridge.input_profile})
+            if path in ('/api/task-sources/photo-points','/api/task-sources/database-points'):
+                site_id = (query.get('large_cage_id') or [''])[0]
+                points = [point for point in bridge.approved_photo_points()
+                          if not site_id or point['site_id'] == site_id]
+                return self.send_json({'points': points, 'mode': 'APPROVED_DATABASE_POINTS_ONLY',
                                        'altitude_source': 'WEB_PARAMETER_RELATIVE_ALT',
                                        'photo_altitude_ignored': True})
-            if self.path == '/api/realflight/precheck': return self.send_json(bridge.precheck)
-            if self.path == '/api/rosbag/status': return self.send_json(bridge.bag.status())
-            if self.path == '/api/rosbag/list': return self.send_json({'directories': bridge.bag.recent()})
+            if path == '/api/realflight/precheck': return self.send_json(bridge.precheck)
+            if path == '/api/rosbag/status': return self.send_json(bridge.bag.status())
+            if path == '/api/rosbag/list': return self.send_json({'directories': bridge.bag.recent()})
             path = os.path.join(web_root, 'index.html')
             with open(path, 'rb') as handle: body = handle.read()
             self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -565,13 +683,17 @@ def handler_factory(bridge, web_root):
                     if bridge.preview_pending or bridge.waypoints is None or not bridge.waypoints.waypoints:
                         return self.send_json({'error': 'PREVIEW_NOT_AVAILABLE'}, 409)
                     bridge.freeze_confirmed_preview()
+                    snapshot = bridge.save_snapshot()
                     bridge.preview_confirmed = True
-                    return self.send_json({'ok': True})
+                    return self.send_json({'ok': True, 'snapshot': snapshot})
                 if self.path in ('/api/start', '/api/realflight/start-circle'):
                     requested = bridge.normalized_payload(payload)
                     if requested != bridge.preview_payload:
                         bridge.preview_confirmed = False
                         return self.send_json({'error': 'PARAMETERS_CHANGED_REPREVIEW_REQUIRED'}, 409)
+                    if not bridge.verify_frozen_versions():
+                        bridge.preview_confirmed = False
+                        return self.send_json({'error': 'APPROVED_POINT_VERSION_CHANGED_REPREVIEW_REQUIRED'}, 409)
                     blockers = bridge.start_blockers() if rospy.get_param('/web_bridge/real_flight', False) else []
                     if blockers: return self.send_json({'error': 'MISSION_START_BLOCKED', 'blockers': blockers}, 409)
                     if requested['task_source'] == 'GPS_CENTER':
@@ -590,6 +712,17 @@ def handler_factory(bridge, web_root):
                     return self.send_json({'ok': ok, 'missing': missing}, 200 if ok else 400)
                 if self.path == '/api/realflight/revoke-site-confirmation':
                     rospy.set_param('/realflight/site_alignment_confirmed', False); return self.send_json({'ok': True})
+                if self.path == '/api/realflight/return-now':
+                    bridge.cancel_pub.publish(Empty())
+                    bridge.preview_confirmed = False; bridge.reset_submission()
+                    bridge.update_snapshot('USER_RETURN_REQUESTED', {
+                        'requested_at': time.time(), 'fcu_mode': bridge.fcu.mode,
+                        'armed': bridge.fcu.armed, 'battery': bridge.battery_json(),
+                        'position': None if bridge.uav_gps is None else {
+                            'lat': bridge.uav_gps.latitude, 'lon': bridge.uav_gps.longitude,
+                            'alt': bridge.uav_gps.altitude}})
+                    bridge.return_pub.publish(Empty())
+                    return self.send_json({'ok': True, 'return_control': bridge.return_control}, 202)
                 if self.path == '/api/rosbag/start':
                     ok, error = bridge.bag.start(bridge.status_json())
                     return self.send_json({'ok': ok, 'error': error, 'rosbag': bridge.bag.status()}, 200 if ok else 409)
@@ -598,6 +731,9 @@ def handler_factory(bridge, web_root):
                     ok, error = bridge.bag.stop(bridge.status_json())
                     return self.send_json({'ok': ok, 'error': error, 'rosbag': bridge.bag.status()}, 200 if ok else 409)
                 if self.path == '/api/cancel':
+                    if bridge.fcu.armed or bridge.mission.state in (
+                            'TAKEOFF','TRANSIT','FEEDING','FEEDING_DWELL','EXIT','RTL','USER_RETURN','LAND'):
+                        return self.send_json({'error': 'AIRBORNE_USE_RETURN_OR_H12'}, 409)
                     bridge.cancel_pub.publish(Empty()); bridge.reset_submission()
                     return self.send_json({'ok': True})
             except (ValueError, TypeError) as exc:

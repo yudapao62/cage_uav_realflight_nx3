@@ -9,7 +9,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.realpath(os.path.join(HERE, '..', 'scripts')))
 
 from cage_geo.geodesy import LocalENU
-from mission_modes import plan_gps_grid, plan_photo_points
+from mission_modes import battery_status, plan_gps_grid, plan_photo_points
 
 
 class MissionModePlannerTest(unittest.TestCase):
@@ -83,6 +83,18 @@ class MissionModePlannerTest(unittest.TestCase):
             plan_gps_grid(self.HOME, a, b, 20, 20,
                           10.0, 12.0, 8.0, 5.0)
 
+    def test_manual_database_order_is_preserved(self):
+        local = LocalENU(*self.HOME)
+        far = local.to_wgs84(80.0, 0.0, 0.0)
+        near = local.to_wgs84(20.0, 0.0, 0.0)
+        plan, details = plan_photo_points(self.HOME, [
+            {'id': 'far', 'label': 'FAR', 'lat': far[0], 'lon': far[1]},
+            {'id': 'near', 'label': 'NEAR', 'lat': near[0], 'lon': near[1]},
+        ], 10.0, 12.0, 7.5, 4.0, preserve_order=True)
+        targets = [point for point in plan if point['type'] == 'CELL_TARGET']
+        self.assertEqual(['FAR', 'NEAR'], [point['cell_id'] for point in targets])
+        self.assertEqual('MANUAL', details['order_mode'])
+
     def test_grid_rejects_coincident_diagonal_pair(self):
         local = LocalENU(*self.HOME)
         a = local.to_wgs84(10.0, 0.0, 0.0)
@@ -90,6 +102,16 @@ class MissionModePlannerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan_gps_grid(self.HOME, a, b, 2, 3,
                           10.0, 12.0, 8.0, 5.0)
+
+    def test_battery_unknown_stale_and_low_are_truthful(self):
+        unknown = battery_status(float('nan'), 47.2, 10.0, 10.5, 3.0, 0.2)
+        self.assertIsNone(unknown['percentage'])
+        self.assertEqual(47.2, unknown['voltage'])
+        self.assertTrue(unknown['fresh'])
+        stale = battery_status(0.7, 47.2, 10.0, 14.0, 3.0, 0.2)
+        self.assertFalse(stale['fresh'])
+        low = battery_status(0.2, 44.0, 10.0, 10.1, 3.0, 0.2)
+        self.assertTrue(low['low'])
 
 
 if __name__ == '__main__':

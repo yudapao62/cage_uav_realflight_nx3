@@ -9,9 +9,8 @@ import rosgraph
 import rosnode
 import rospy
 from std_msgs.msg import Bool, String
-from sensor_msgs.msg import NavSatFix, NavSatStatus
+from sensor_msgs.msg import BatteryState, NavSatFix, NavSatStatus
 from mavros_msgs.msg import State, RCIn
-from gps_receiver.msg import AnchorFix
 from cage_msgs.msg import CageGeometry, CageGrid, MissionState
 from cage_geo.geodesy import LocalENU
 
@@ -88,6 +87,11 @@ class GroundGPSHealth:
 
 class Precheck:
     def __init__(self):
+        self.input_profile = str(rospy.get_param(
+            '/realflight/input_profile', 'GROUND_GPS')).strip().upper()
+        if self.input_profile not in ('GROUND_GPS', 'PHOTO_COORDS'):
+            raise ValueError('invalid /realflight/input_profile: {}'.format(
+                self.input_profile))
         self.geometry_mode = str(rospy.get_param('/cage/geometry_mode', 'rectangular')).strip().lower()
         if self.geometry_mode not in ('rectangular', 'circular'):
             raise ValueError('invalid /cage/geometry_mode: {}'.format(self.geometry_mode))
@@ -101,6 +105,7 @@ class Precheck:
         self.fcu = None; self.fcu_at = 0.0
         self.gps = None; self.gps_at = 0.0
         self.rc = None; self.rc_at = 0.0
+        self.battery = None; self.battery_at = 0.0
         self.grid = None; self.home = None; self.geometry = None
         self.feeder_status_at = 0.0
         self.fsm = None; self.last_fsm_state = None
@@ -110,10 +115,13 @@ class Precheck:
         rospy.Subscriber('/mavros/state', State, self.on_fcu, queue_size=1)
         rospy.Subscriber('/mavros/global_position/global', NavSatFix, self.on_gps, queue_size=1)
         rospy.Subscriber('/mavros/rc/in', RCIn, self.on_rc, queue_size=1)
-        rospy.Subscriber(rospy.get_param('/beacon/input_topic_a', '/farm/scene_1/anchor_A/fix'),
-                         AnchorFix, lambda msg: self.ground['A'].update(msg), queue_size=20)
-        rospy.Subscriber(rospy.get_param('/beacon/input_topic_b', '/farm/scene_1/anchor_B/fix'),
-                         AnchorFix, lambda msg: self.ground['B'].update(msg), queue_size=20)
+        rospy.Subscriber('/mavros/battery', BatteryState, self.on_battery, queue_size=1)
+        if self.input_profile == 'GROUND_GPS':
+            from gps_receiver.msg import AnchorFix
+            rospy.Subscriber(rospy.get_param('/beacon/input_topic_a', '/farm/scene_1/anchor_A/fix'),
+                             AnchorFix, lambda msg: self.ground['A'].update(msg), queue_size=20)
+            rospy.Subscriber(rospy.get_param('/beacon/input_topic_b', '/farm/scene_1/anchor_B/fix'),
+                             AnchorFix, lambda msg: self.ground['B'].update(msg), queue_size=20)
         rospy.Subscriber('/cage/grid_info', CageGrid, lambda m: setattr(self, 'grid', m), queue_size=1)
         rospy.Subscriber('/cage/geometry', CageGeometry, lambda m: setattr(self, 'geometry', m), queue_size=1)
         rospy.Subscriber('/cage/home', NavSatFix, lambda m: setattr(self, 'home', m), queue_size=1)
@@ -125,6 +133,7 @@ class Precheck:
     def on_fcu(self, msg): self.fcu = msg; self.fcu_at = time.monotonic()
     def on_gps(self, msg): self.gps = msg; self.gps_at = time.monotonic()
     def on_rc(self, msg): self.rc = msg; self.rc_at = time.monotonic()
+    def on_battery(self, msg): self.battery = msg; self.battery_at = time.monotonic()
     def on_fsm(self, msg):
         if (self.last_fsm_state is not None and msg.state != self.last_fsm_state and
                 msg.state in ('FINISHED', 'FAILSAFE', 'ERROR', 'MANUAL_OVERRIDE')):
@@ -159,12 +168,19 @@ class Precheck:
     def _prestart_mode_ok(fcu_ok, mode, allowed_start_modes):
         return bool(fcu_ok and mode in set(allowed_start_modes))
 
+    @staticmethod
+    def _profile_compatible(input_profile, task_source):
+        return ((input_profile == 'GROUND_GPS' and task_source in ('GPS_CENTER', 'GPS_GRID')) or
+                (input_profile == 'PHOTO_COORDS' and task_source == 'PHOTO_POINTS'))
+
     def tick(self, _event):
         now = time.monotonic()
-        task_source = str(rospy.get_param('/realflight/task_source_mode', 'GPS_CENTER')).strip().upper()
+        default_source = 'GPS_CENTER' if self.input_profile == 'GROUND_GPS' else 'PHOTO_POINTS'
+        task_source = str(rospy.get_param('/realflight/task_source_mode', default_source)).strip().upper()
         if task_source not in ('GPS_CENTER', 'GPS_GRID', 'PHOTO_POINTS'):
-            task_source = 'GPS_CENTER'
-        ground_required = task_source in ('GPS_CENTER', 'GPS_GRID')
+            task_source = default_source
+        ground_required = self.input_profile == 'GROUND_GPS'
+        profile_task_compatible = self._profile_compatible(self.input_profile, task_source)
         uav_gps_ok = (self.gps is not None and now-self.gps_at <= float(rospy.get_param('/safety/gps_timeout', 2.0))
             and self.gps.status.status >= NavSatStatus.STATUS_FIX
             and all(math.isfinite(v) for v in (self.gps.latitude, self.gps.longitude, self.gps.altitude))
@@ -188,6 +204,8 @@ class Precheck:
                 center_distance = math.hypot(east, north)
                 center_ok = center_distance <= float(rospy.get_param('/safety/max_leg_distance', 5000.0))
         rc_ok = self.rc is not None and bool(self.rc.channels) and now-self.rc_at <= 2.0
+        battery_ok = (self.battery is not None and now-self.battery_at <=
+                      float(rospy.get_param('/safety/battery_telemetry_timeout_sec', 3.0)))
         try:
             names = set(rosnode.get_node_names())
             simulation_absent = not any('gazebo' in n or 'feeder_simulator' in n or 'simulation_acceptance' in n for n in names)
@@ -203,9 +221,11 @@ class Precheck:
             'FCU': fcu_ok, 'UAV_GPS': uav_gps_ok,
             'PRESTART_MODE': prestart_mode_ok, 'SIMULATION_ABSENT': simulation_absent,
             'RC_INPUT': rc_ok if rospy.get_param('/vehicle/require_rc_ready', True) else True,
+            'BATTERY_TELEMETRY': battery_ok,
             'GROUND_GPS_A': ground['A']['healthy'] if ground_required else 'SKIPPED',
             'GROUND_GPS_B': ground['B']['healthy'] if ground_required else 'SKIPPED',
             'GEOMETRY': beacon_ok if ground_required else 'SKIPPED',
+            'INPUT_PROFILE_TASK_COMPATIBLE': profile_task_compatible,
             'ACFLY_MODE_CONFLICT_ABSENT': not conflict,
             'FSM_READY': bool(self.fsm and not self.fsm.manual_override and self.fsm.state in ('IDLE', 'FINISHED')),
             'AUTO_ARM_FALSE': rospy.get_param('/vehicle/auto_arm', True) is False,
@@ -247,6 +267,7 @@ class Precheck:
             'ready': ready, 'resume_ready': resume_ready, 'checks': checks,
             'blockers': blockers, 'ground_gps': ground, 'beacon': self.beacon,
             'geometry_mode': self.geometry_mode, 'task_source': task_source,
+            'input_profile': self.input_profile,
             'ground_gps_required': ground_required, 'center_distance_m': center_distance,
             'fcu_mode': self.fcu.mode if self.fcu else '',
             'manual_override_latched': bool(self.fsm and self.fsm.manual_override),

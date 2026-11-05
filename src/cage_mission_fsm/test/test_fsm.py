@@ -24,7 +24,7 @@ class FSMTest(unittest.TestCase):
         self.assertFalse(f.request('m1', resume=True))
     def test_manual_takeover_all_task_and_recovery_states(self):
         states=(States.TAKEOFF,States.TRANSIT,States.FEEDING,States.FEEDING_DWELL,States.EXIT,
-                States.RTL,States.LAND,States.TIMEOUT_ABORT,States.RECOVERY_RTL,
+                States.RTL,States.USER_RETURN,States.LAND,States.TIMEOUT_ABORT,States.RECOVERY_RTL,
                 States.RECOVERY_RTL_VERIFY,States.RECOVERY_RETURNING,
                 States.RECOVERY_LANDING,States.RECOVERY_LANDED)
         for state in states:
@@ -88,6 +88,25 @@ class FSMTest(unittest.TestCase):
         f.waypoint_reached(3,'CELL_TARGET','R01C01')
         self.assertTrue(f.grid_complete())
         self.assertEqual(f.state, States.FINISHED)
+    def test_user_return_abandons_active_task_and_closes_feeder(self):
+        f=self.active_fsm(); f.waypoint_reached(3,'CELL_TARGET','R01C01')
+        self.assertTrue(f.feeder_enabled)
+        self.assertTrue(f.user_return(armed=True))
+        self.assertEqual(f.state, States.USER_RETURN)
+        self.assertEqual(f.reason, 'USER_RETURN_REQUESTED')
+        self.assertTrue(f.mission_aborted)
+        self.assertFalse(f.feeder_enabled)
+        self.assertEqual(f.current_cell_id, '')
+    def test_user_return_disarmed_cancels_without_rtl(self):
+        f=MissionFSM(); f.initialize(); f.fcu_connected(); f.gps_valid()
+        self.assertTrue(f.user_return(armed=False))
+        self.assertEqual(f.state, States.FINISHED)
+        self.assertEqual(f.reason, 'USER_RETURN_CANCELLED_DISARMED')
+    def test_manual_takeover_stays_above_user_return(self):
+        f=self.active_fsm(); self.assertTrue(f.mode_changed('POSCTL','AUTO.MISSION'))
+        self.assertFalse(f.user_return(armed=True))
+        self.assertEqual(f.state, States.MANUAL_OVERRIDE)
+        self.assertEqual(f.reason, 'USER_RETURN_BLOCKED_BY_MANUAL_OVERRIDE')
     def test_timeout_recovery_chain(self):
         f=MissionFSM(); f.initialize(); f.fcu_connected(); f.gps_valid(); f.request('m1'); f.planned(); f.upload_result(True); f.armed_and_auto()
         f.waypoint_reached(3,'FEED_START'); f.timeout_abort('FEEDING_TIMEOUT')

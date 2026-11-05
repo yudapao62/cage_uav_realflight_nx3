@@ -13,8 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from . import SAFETY_MODE, __version__, config
 from .db import dump, init_db, load, now, row, rows, transaction, uid
-from .importers.csv_importer import import_csv
-from .importers.dji_txt_adapter import import_txt
+from .importers.coordinate_csv import import_coordinate_csv, import_subcage_csv
 from .importers.exif_importer import import_photo
 from .processing.geometry import enu_xy, haversine_m, valid_coordinate
 
@@ -33,14 +32,15 @@ def _decode(record):
 def _site_map():
     with transaction() as conn:
         photos = rows(conn.execute("SELECT s.*,a.original_name,a.source_role FROM gps_samples s JOIN source_assets a ON a.id=s.source_asset_id WHERE s.origin_type='PHOTO_EXIF'"))
-        approved = rows(conn.execute("SELECT p.*,c.label FROM approved_point_versions p JOIN subcages c ON c.id=p.subcage_id WHERE p.active=1"))
-        segments = rows(conn.execute("SELECT * FROM track_segments ORDER BY session_id,segment_index"))
-        for segment in segments:
-            segment["points"] = rows(conn.execute("SELECT s.latitude,s.longitude,s.timestamp_utc,s.altitude_m,s.quality_flags FROM track_segment_samples x JOIN gps_samples s ON s.id=x.sample_id WHERE x.segment_id=? ORDER BY x.seq", (segment["id"],)))
+        approved = rows(conn.execute("""SELECT p.*,c.label,c.site_id,q.calculation_method AS source_method
+            FROM approved_point_versions p JOIN subcages c ON c.id=p.subcage_id
+            JOIN sites g ON g.id=c.site_id
+            LEFT JOIN candidate_points q ON q.id=p.candidate_point_id
+            WHERE p.active=1 AND c.status='ACTIVE' AND g.status='ACTIVE'"""))
         routes = rows(conn.execute("SELECT * FROM route_previews ORDER BY created_at DESC LIMIT 20"))
         for route in routes:
             route["points"] = rows(conn.execute("SELECT * FROM route_preview_points WHERE route_id=? ORDER BY seq", (route["id"],)))
-    return {"mode": SAFETY_MODE, "photos": photos, "approved": approved, "segments": segments, "routes": routes}
+    return {"mode": SAFETY_MODE, "photos": photos, "approved": approved, "routes": routes}
 
 
 def _route(route_id):
@@ -179,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
         return form, fields if isinstance(fields, list) else [fields]
 
     def import_files(self, kind):
-        limits = {"photos": config.MAX_PHOTO_BYTES * config.MAX_BATCH_FILES, "dji-txt": config.MAX_TXT_BYTES, "normalized-csv": config.MAX_CSV_BYTES}
+        limits = {"photos": config.MAX_PHOTO_BYTES * config.MAX_BATCH_FILES}
         form, fields = self.multipart(limits[kind])
         if not fields or len(fields) > config.MAX_BATCH_FILES: raise ValueError("UPLOAD_BATCH_INVALID")
         job_id = uid("job"); results = []
@@ -188,14 +188,12 @@ class Handler(BaseHTTPRequestHandler):
         for field in fields:
             name = os.path.basename(field.filename or "upload")
             suffix = os.path.splitext(name)[1].lower()
-            fd, temp = tempfile.mkstemp(prefix="upload_", suffix=suffix, dir=os.path.join(config.ROOT, "incoming", "photos" if kind == "photos" else "flight_txt" if kind == "dji-txt" else "converted"))
+            fd, temp = tempfile.mkstemp(prefix="upload_", suffix=suffix, dir=os.path.join(config.ROOT, "incoming", "photos"))
             os.close(fd)
             try:
                 with open(temp, "wb") as target: shutil.copyfileobj(field.file, target, 1024 * 1024)
-                site_id = form.getfirst("site_id") or None; source_role = form.getfirst("source_role") or "WEB_UPLOAD"
-                if kind == "photos": result = import_photo(temp, name, source_role, form.getfirst("session_id") or None)
-                elif kind == "dji-txt": result = import_txt(temp, name, site_id, source_role)
-                else: result = import_csv(temp, name, site_id, source_role)
+                source_role = form.getfirst("source_role") or "WEB_UPLOAD"
+                result = import_photo(temp, name, source_role, form.getfirst("session_id") or None)
                 results.append({"file": name, "ok": result.get("import_status") not in ("FAILED", "BLOCKED"), "result": result})
             except Exception as exc:
                 results.append({"file": name, "ok": False, "error": str(exc)})
@@ -214,8 +212,8 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/site-db", "/site-db/"):
                 with open(os.path.join(WWW, "index.html"), "rb") as handle: return self.send_body(200, "text/html; charset=utf-8", handle.read())
             if path == "/api/site-db/health":
-                return self.json({"ok": True, "version": __version__, "mode": SAFETY_MODE, "preview_only": True, "realflight_eligible": False,
-                                  "dji_txt_current_flight": "DJI_TXT_PENDING_UPLOAD"})
+                return self.json({"ok": True, "version": __version__, "mode": SAFETY_MODE, "flight_control_effect": False,
+                                  "coordinate_sources": ["PHOTO_EXIF", "MANUAL_WGS84", "MANUAL_WGS84_CSV"]})
             if path == "/api/site-db/map": return self.json(_site_map())
             if path == "/api/site-db/sites":
                 with transaction() as conn: return self.json(rows(conn.execute("SELECT * FROM sites ORDER BY created_at")))
@@ -250,14 +248,23 @@ class Handler(BaseHTTPRequestHandler):
                 target=os.path.join(config.THUMBNAILS,asset["sha256"]+".jpg")
                 if not os.path.isfile(target): return self.json({"error":"THUMBNAIL_NOT_FOUND"},404)
                 with open(target,"rb") as handle: return self.send_body(200,"image/jpeg",handle.read())
-            if path == "/api/site-db/sessions":
-                with transaction() as conn: return self.json(rows(conn.execute("SELECT s.*,COUNT(t.id) segment_count FROM capture_sessions s LEFT JOIN track_segments t ON t.session_id=s.id GROUP BY s.id ORDER BY s.created_at DESC")))
-            if path.startswith("/api/site-db/sessions/") and path.endswith("/tracks"):
-                session_id=path.split("/")[-2]
-                data=_site_map(); return self.json({"session_id":session_id,"segments":[s for s in data["segments"] if s["session_id"]==session_id]})
-            if path.startswith("/api/site-db/tracks/"):
-                session_id=path.rsplit("/",1)[-1]
-                data=_site_map(); return self.json({"session_id":session_id,"segments":[s for s in data["segments"] if s["session_id"]==session_id]})
+            if path.startswith("/api/site-db/large-cages/") and path.endswith("/mission-points"):
+                site_id=path.split("/")[-2]
+                with transaction() as conn:
+                    data=rows(conn.execute("""SELECT p.id,p.subcage_id,p.version,p.lat,p.lon,p.approved_at,
+                        s.label,s.row_index,s.col_index,q.calculation_method AS source_method
+                        FROM approved_point_versions p JOIN subcages s ON s.id=p.subcage_id
+                        JOIN sites g ON g.id=s.site_id
+                        LEFT JOIN candidate_points q ON q.id=p.candidate_point_id
+                        WHERE s.site_id=? AND s.status='ACTIVE' AND g.status='ACTIVE' AND p.active=1 ORDER BY s.label""",(site_id,)))
+                return self.json({"site_id":site_id,"points":data})
+            if path.startswith("/api/site-db/subcages/") and path.endswith("/point-versions"):
+                subcage_id=path.split("/")[-2]
+                with transaction() as conn:
+                    data=rows(conn.execute("""SELECT p.*,q.calculation_method AS source_method
+                        FROM approved_point_versions p LEFT JOIN candidate_points q ON q.id=p.candidate_point_id
+                        WHERE p.subcage_id=? ORDER BY p.version DESC""",(subcage_id,)))
+                return self.json({"subcage_id":subcage_id,"versions":[_decode(x) for x in data]})
             if path == "/api/site-db/points":
                 with transaction() as conn:
                     if query.get("site_id"):
@@ -285,8 +292,14 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlparse(self.path).path
         try:
             if path == "/api/site-db/imports/photos": return self.json(self.import_files("photos"),201)
-            if path == "/api/site-db/imports/dji-txt": return self.json(self.import_files("dji-txt"),201)
-            if path == "/api/site-db/imports/normalized-csv": return self.json(self.import_files("normalized-csv"),201)
+            if path == "/api/site-db/imports/coordinate-csv":
+                form, fields = self.multipart(config.MAX_COORDINATE_CSV_BYTES)
+                if len(fields) != 1: raise ValueError("ONE_COORDINATE_CSV_REQUIRED")
+                return self.json(import_coordinate_csv(fields[0].file.read(), form.getfirst("site_id")),201)
+            if path == "/api/site-db/imports/subcage-csv":
+                form, fields = self.multipart(config.MAX_COORDINATE_CSV_BYTES)
+                if len(fields) != 1: raise ValueError("ONE_SUBCAGE_CSV_REQUIRED")
+                return self.json(import_subcage_csv(fields[0].file.read(), form.getfirst("site_id")),201)
             payload=self.body_json()
             if path.startswith("/api/site-db/sites/") and path.endswith("/subcages"):
                 payload["site_id"] = path.split("/")[-2]
@@ -297,6 +310,10 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/site-db/points/") and path.endswith("/approve"):
                 payload["candidate_point_id"] = path.split("/")[-2]
                 path = "/api/site-db/points/approve"
+            if path.startswith("/api/site-db/sites/") and path.endswith("/status"):
+                payload["site_id"] = path.split("/")[-2]; path = "/api/site-db/sites/status"
+            if path.startswith("/api/site-db/subcages/") and path.endswith("/status"):
+                payload["subcage_id"] = path.split("/")[-2]; path = "/api/site-db/subcages/status"
             if path == "/api/site-db/sites":
                 if not str(payload.get("name","")).strip(): raise ValueError("SITE_NAME_REQUIRED")
                 site_id=uid("site")
@@ -305,19 +322,68 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/site-db/subcages":
                 if not payload.get("site_id") or not str(payload.get("label","")).strip(): raise ValueError("SITE_AND_LABEL_REQUIRED")
                 subcage_id=uid("subcage")
-                with transaction() as conn: conn.execute("INSERT INTO subcages VALUES (?,?,?,?,?,?,?)",(subcage_id,payload["site_id"],payload["label"].strip(),payload.get("row_index"),payload.get("col_index"),payload.get("notes"),now()))
+                with transaction() as conn:
+                    if conn.execute("SELECT COUNT(*) FROM subcages WHERE site_id=?",(payload["site_id"],)).fetchone()[0] >= 200:
+                        raise ValueError("SUBCAGE_LIMIT_200")
+                    conn.execute("""INSERT INTO subcages
+                        (id,site_id,label,row_index,col_index,notes,created_at,status)
+                        VALUES (?,?,?,?,?,?,?,'ACTIVE')""",(subcage_id,payload["site_id"],payload["label"].strip(),payload.get("row_index"),payload.get("col_index"),payload.get("notes"),now()))
                 return self.json({"id":subcage_id},201)
+            if path == "/api/site-db/subcages/bulk":
+                site_id=str(payload.get("site_id") or ""); prefix=str(payload.get("prefix") or "").strip()
+                start=int(payload.get("start",1)); count=int(payload.get("count",0)); padding=int(payload.get("padding",3))
+                if not site_id or not prefix or not 1 <= count <= 200 or not 1 <= padding <= 6:
+                    raise ValueError("BULK_SUBCAGE_PARAMETERS_INVALID")
+                created=[]
+                with transaction() as conn:
+                    if not row(conn.execute("SELECT id FROM sites WHERE id=? AND status='ACTIVE'",(site_id,))):
+                        raise ValueError("ACTIVE_SITE_REQUIRED")
+                    if conn.execute("SELECT COUNT(*) FROM subcages WHERE site_id=?",(site_id,)).fetchone()[0] + count > 200:
+                        raise ValueError("SUBCAGE_LIMIT_200")
+                    for number in range(start,start+count):
+                        subcage_id=uid("subcage"); label=("%s%0*d"%(prefix,padding,number))
+                        conn.execute("""INSERT INTO subcages
+                            (id,site_id,label,row_index,col_index,notes,created_at,status)
+                            VALUES (?,?,?,?,?,?,?,'ACTIVE')""",
+                            (subcage_id,site_id,label,None,None,payload.get("notes"),now()))
+                        created.append({"id":subcage_id,"label":label})
+                return self.json({"site_id":site_id,"created":created,"count":len(created)},201)
+            if path == "/api/site-db/sites/status":
+                status=str(payload.get("status") or "").upper()
+                if status not in ("ACTIVE","INACTIVE"): raise ValueError("STATUS_INVALID")
+                with transaction() as conn: conn.execute("UPDATE sites SET status=? WHERE id=?",(status,payload.get("site_id")))
+                return self.json({"ok":True,"status":status})
+            if path == "/api/site-db/subcages/status":
+                status=str(payload.get("status") or "").upper()
+                if status not in ("ACTIVE","INACTIVE"): raise ValueError("STATUS_INVALID")
+                with transaction() as conn: conn.execute("UPDATE subcages SET status=? WHERE id=?",(status,payload.get("subcage_id")))
+                return self.json({"ok":True,"status":status})
+            if path == "/api/site-db/points/manual-candidate":
+                for key in ("site_id","subcage_id","reviewer","lat","lon"):
+                    if payload.get(key) in (None,""): raise ValueError("MANUAL_%s_REQUIRED"%key.upper())
+                lat,lon=float(payload["lat"]),float(payload["lon"])
+                if not valid_coordinate(lat,lon): raise ValueError("GPS_SAMPLE_INVALID")
+                candidate_id=uid("candidate")
+                with transaction() as conn:
+                    sub=row(conn.execute("SELECT id FROM subcages WHERE id=? AND site_id=? AND status='ACTIVE'",(payload["subcage_id"],payload["site_id"])))
+                    if not sub: raise ValueError("ACTIVE_SUBCAGE_SITE_MISMATCH")
+                    evidence={"reviewer":payload["reviewer"],"note":payload.get("note","")}
+                    conn.execute("INSERT INTO candidate_points VALUES (?,?,?,?,?,?,?,?,?)",
+                                 (candidate_id,sub["id"],"MANUAL_WGS84",lat,lon,dump(evidence),"USER_REVIEW_REQUIRED","PENDING",now()))
+                return self.json({"candidate_point_id":candidate_id,"status":"PENDING"},201)
             if path == "/api/site-db/bindings/photo":
                 for key in ("photo_asset_id","subcage_id","reviewer"):
                     if not payload.get(key): raise ValueError("BINDING_%s_REQUIRED"%key.upper())
                 binding_id=uid("binding")
                 with transaction() as conn:
+                    if not row(conn.execute("SELECT id FROM subcages WHERE id=? AND status='ACTIVE'",(payload["subcage_id"],))):
+                        raise ValueError("ACTIVE_SUBCAGE_REQUIRED")
                     sample=row(conn.execute("SELECT * FROM gps_samples WHERE source_asset_id=? AND origin_type='PHOTO_EXIF' LIMIT 1",(payload["photo_asset_id"],)))
                     conn.execute("INSERT INTO photo_bindings VALUES (?,?,?,?,?,?,?)",(binding_id,payload["photo_asset_id"],payload["subcage_id"],payload.get("capture_marker"),payload.get("binding_confidence","USER_CONFIRMED"),payload["reviewer"],now()))
                     candidate_id=None
                     if sample:
                         candidate_id=uid("candidate")
-                        conn.execute("INSERT INTO candidate_points VALUES (?,?,?,?,?,?,?,?,?)",(candidate_id,payload["subcage_id"],"PHOTO_CENTER_PROXY",sample["latitude"],sample["longitude"],dump([sample["id"]]),"PHOTO_CENTER_PROXY_UNVERIFIED","PENDING",now()))
+                        conn.execute("INSERT INTO candidate_points VALUES (?,?,?,?,?,?,?,?,?)",(candidate_id,payload["subcage_id"],"PHOTO_EXIF",sample["latitude"],sample["longitude"],dump([sample["id"]]),"PHOTO_CENTER_PROXY_UNVERIFIED","PENDING",now()))
                 return self.json({"binding_id":binding_id,"candidate_point_id":candidate_id,"warning":"PHOTO GPS is camera/drone position; manual approval required"},201)
             if path == "/api/site-db/points/approve":
                 if not payload.get("candidate_point_id") or not payload.get("reviewer"): raise ValueError("CANDIDATE_AND_REVIEWER_REQUIRED")
@@ -333,7 +399,37 @@ class Handler(BaseHTTPRequestHandler):
                     evidence={"candidate_point_id":candidate["id"],"source_sample_ids":load(candidate["source_sample_ids"],[]),"original_quality":candidate["quality"],"coordinate_edited":lat!=candidate["lat"] or lon!=candidate["lon"]}
                     conn.execute("INSERT INTO approved_point_versions VALUES (?,?,?,?,?,?,?,?,?,?,?)",(approved_id,candidate["subcage_id"],candidate["id"],version,lat,lon,dump(evidence),payload["reviewer"],payload.get("review_note"),now(),1))
                     conn.execute("UPDATE candidate_points SET status='APPROVED' WHERE id=?",(candidate["id"],))
-                return self.json({"id":approved_id,"version":version,"realflight_eligible":False,"mode":"PREVIEW_ONLY"},201)
+                return self.json({"id":approved_id,"version":version,"coordinate_approved":True,"mode":"DATA_ONLY"},201)
+            if path == "/api/site-db/mission-snapshots":
+                required=("mission_id","input_profile","home","parameters","preview_hash")
+                if any(key not in payload for key in required): raise ValueError("SNAPSHOT_FIELDS_REQUIRED")
+                home=payload["home"]; params=payload["parameters"]; snapshot_id=uid("snapshot"); stamp=now()
+                with transaction() as conn:
+                    existing=row(conn.execute("SELECT id,preview_hash,state FROM mission_snapshots WHERE mission_id=?",(payload["mission_id"],)))
+                    if existing:
+                        if existing["preview_hash"] == payload["preview_hash"]:
+                            return self.json({"id":existing["id"],"mission_id":payload["mission_id"],"idempotent":True},200)
+                        raise ValueError("TASK_ID_ALREADY_USED_CHANGE_TASK_ID")
+                    conn.execute("""INSERT INTO mission_snapshots
+                        (id,mission_id,input_profile,site_id,home_lat,home_lon,home_alt,
+                         takeoff_relative_alt,transit_relative_alt,feed_relative_alt,feeding_dwell_sec,
+                         waypoint_hold_sec,speed,acceptance_radius,preview_hash,state,details_json,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (snapshot_id,payload["mission_id"],payload["input_profile"],payload.get("site_id"),
+                         home["lat"],home["lon"],home.get("alt"),params["takeoff_relative_alt"],
+                         params["transit_relative_alt"],params["feed_relative_alt"],params["feeding_dwell_sec"],
+                         params["waypoint_hold_sec"],params["speed"],params["acceptance_radius"],
+                         payload["preview_hash"],payload.get("state","PREVIEW_CONFIRMED"),dump(payload.get("details",{})),stamp,stamp))
+                    for seq,target in enumerate(payload.get("targets",[])):
+                        conn.execute("INSERT INTO mission_snapshot_targets VALUES (?,?,?,?,?,?,?)",
+                                     (snapshot_id,seq,target.get("subcage_id"),target.get("approved_version_id"),
+                                      target.get("label",str(seq)),target["lat"],target["lon"]))
+                return self.json({"id":snapshot_id,"mission_id":payload["mission_id"]},201)
+            if path.startswith("/api/site-db/mission-snapshots/") and path.endswith("/state"):
+                mission_id=urllib.parse.unquote(path.split("/")[-2]); state=str(payload.get("state") or "")
+                if not state: raise ValueError("SNAPSHOT_STATE_REQUIRED")
+                with transaction() as conn: conn.execute("UPDATE mission_snapshots SET state=?,details_json=?,updated_at=? WHERE mission_id=?",(state,dump(payload.get("details",{})),now(),mission_id))
+                return self.json({"ok":True,"mission_id":mission_id,"state":state})
             if path == "/api/site-db/route-previews": return self.json(create_route(payload),201)
             return self.json({"error":"NOT_FOUND","path":path},404)
         except Exception as exc:

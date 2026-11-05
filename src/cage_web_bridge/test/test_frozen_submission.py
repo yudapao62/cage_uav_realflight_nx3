@@ -32,6 +32,7 @@ class FrozenSubmissionTest(unittest.TestCase):
 
     def test_grid_feeding_duration_must_be_shorter_than_hold(self):
         bridge = object.__new__(WebBridge)
+        bridge.input_profile = 'GROUND_GPS'
         payload = {'task_id': 'timing-test', 'task_source': 'GPS_GRID',
                    'grid_rows': 3, 'grid_cols': 3,
                    'feeding_dwell_sec': 10.0, 'waypoint_hold_sec': 10.0}
@@ -44,6 +45,7 @@ class FrozenSubmissionTest(unittest.TestCase):
 
     def test_grid_feeding_and_hold_are_frozen_parameters(self):
         bridge = object.__new__(WebBridge)
+        bridge.input_profile = 'GROUND_GPS'
         payload = {'task_id': 'timing-test', 'task_source': 'GPS_GRID',
                    'grid_rows': 3, 'grid_cols': 3,
                    'feeding_dwell_sec': 5.0, 'waypoint_hold_sec': 10.0}
@@ -54,6 +56,16 @@ class FrozenSubmissionTest(unittest.TestCase):
             result = bridge.normalized_payload(payload)
         self.assertEqual(result['feeding_dwell_sec'], 5.0)
         self.assertEqual(result['waypoint_hold_sec'], 10.0)
+
+    def test_input_profile_cannot_select_other_source(self):
+        bridge = object.__new__(WebBridge)
+        bridge.input_profile = 'PHOTO_COORDS'
+        with mock.patch('web_bridge_node.rospy.Time.now') as now, \
+                mock.patch('web_bridge_node.rospy.get_param',
+                           side_effect=lambda _name, default: default):
+            now.return_value.to_sec.return_value = 1.0
+            with self.assertRaisesRegex(ValueError, 'INPUT_PROFILE_TASK_SOURCE_MISMATCH'):
+                bridge.normalized_payload({'task_source': 'GPS_GRID'})
 
 
 if __name__ == '__main__':

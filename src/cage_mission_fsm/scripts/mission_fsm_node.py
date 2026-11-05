@@ -5,7 +5,7 @@ import time
 import rospy
 from mavros_msgs.msg import RCIn, State, WaypointReached
 from sensor_msgs.msg import BatteryState, NavSatFix, NavSatStatus
-from std_msgs.msg import Bool, Header, String
+from std_msgs.msg import Bool, Empty, Header, String
 from cage_msgs.msg import FeederCommand, MissionRequest, MissionState, MissionWaypointArray
 from cage_mavros_adapter.adapter import MavrosAdapter
 from cage_mission_fsm.core import MissionFSM, RtlRequestController, States
@@ -35,6 +35,9 @@ class MissionFSMNode:
                 self.auto_permission_rc_timeout <= 0.0):
             raise ValueError('invalid AUTO permission switch configuration')
         self.enable_feeding = bool(rospy.get_param('/feeding/enabled', True))
+        self.input_profile = str(rospy.get_param('/realflight/input_profile', 'GROUND_GPS')).strip().upper()
+        if self.input_profile not in ('GROUND_GPS', 'PHOTO_COORDS'):
+            raise ValueError('invalid /realflight/input_profile')
         self.geometry_mode = str(rospy.get_param('/cage/geometry_mode', 'rectangular')).strip().lower()
         if self.geometry_mode not in ('rectangular', 'circular'):
             raise ValueError('invalid /cage/geometry_mode: {}'.format(self.geometry_mode))
@@ -70,6 +73,7 @@ class MissionFSMNode:
                          States.FEEDING_DWELL: rospy.get_param('/mission/feeding_timeout',180.0),
                          States.EXIT: rospy.get_param('/mission/feeding_timeout',180.0),
                          States.RTL: rospy.get_param('/mission/rtl_timeout',600.0),
+                         States.USER_RETURN: rospy.get_param('/mission/rtl_timeout',600.0),
                          States.LAND: rospy.get_param('/mission/rtl_timeout',600.0)}
         self.feeder_off_timeout = rospy.get_param('/mission/timeout_recovery/feeder_off_timeout_sec', 2.0)
         rtl_cfg = rospy.get_param('/mission/timeout_recovery/rtl', {})
@@ -97,8 +101,17 @@ class MissionFSMNode:
         self.grid_feeding_duration_sec = 0.0
         self.grid_cell_started_at = 0.0
         self.grid_cell_index = -1
+        self.return_requested_at = 0.0
+        self.return_requested_monotonic = 0.0
+        self.return_initial_mode = ''
+        self.return_explicit = False
+        self.return_clear_done = False
+        self.return_status = {'state': 'IDLE', 'reason': '', 'requested_at': None,
+                              'attempts': 0}
         self.state_pub = rospy.Publisher('/mission/state', MissionState, queue_size=1, latch=True)
         self.feeder_pub = rospy.Publisher('/feeder/command', FeederCommand, queue_size=1, latch=True)
+        self.return_status_pub = rospy.Publisher('/mission/return_status', String,
+                                                 queue_size=1, latch=True)
         rospy.Subscriber('/mavros/state', State, self.on_state, queue_size=1)
         rospy.Subscriber('/mavros/rc/in', RCIn, self.on_rc, queue_size=1)
         rospy.Subscriber('/mavros/global_position/global', NavSatFix, self.on_gps, queue_size=1)
@@ -106,11 +119,13 @@ class MissionFSMNode:
         rospy.Subscriber('/mavros/battery', BatteryState, self.on_battery, queue_size=1)
         rospy.Subscriber('/mission/request', MissionRequest, self.on_request, queue_size=1)
         rospy.Subscriber('/mission/direct_request', MissionRequest, self.on_request, queue_size=1)
+        rospy.Subscriber('/mission/return_now', Empty, self.on_return_now, queue_size=1)
         rospy.Subscriber('/mission/waypoints', MissionWaypointArray, self.on_waypoints, queue_size=1)
         rospy.Subscriber('/feeder/status', Bool, self.on_feeder_status, queue_size=1)
         if self.require_beacon:
             rospy.Subscriber('/cage/beacon/status', String, self.on_beacon_status, queue_size=1)
         rospy.Timer(rospy.Duration(0.2), self.tick)
+        self.publish_return_status()
         self.publish_state()
 
     def on_state(self, msg):
@@ -132,9 +147,19 @@ class MissionFSMNode:
                     self.rc_channels[index] > self.auto_permission_threshold)
 
     def _check_manual_takeover(self, mode):
+        # A RETURN pressed while already in POSCTL/ALTCTL deliberately asks the
+        # FCU to leave that initial mode.  Allow the first RTL request to be
+        # processed, but never ignore a new pilot-selected manual mode after
+        # AUTO.RTL has been confirmed or after leaving a non-manual mode.
+        if (self.fsm.state == States.USER_RETURN and not self.normal_rtl.confirmed and
+                mode in self.fsm.MANUAL_MODES and mode == self.return_initial_mode and
+                time.monotonic()-self.return_requested_monotonic <= self.rtl_confirm_timeout):
+            return False
         if self.fsm.mode_changed(mode, self.auto_mode):
             rospy.logwarn('Manual takeover detected (%s); NX relinquishes control', mode)
             self.command_feeder(False, 'MANUAL_OVERRIDE')
+            if self.return_explicit:
+                self.set_return_status('MANUAL_OVERRIDE', 'H12_MANUAL_TAKEOVER')
             self._state_changed()
             return True
         return self.fsm.manual_override_latched
@@ -152,11 +177,66 @@ class MissionFSMNode:
 
     def on_battery(self, msg):
         if math.isfinite(msg.percentage) and 0 <= msg.percentage < self.low_battery_threshold:
+            self.command_feeder(False, 'LOW_BATTERY')
+            if self.fsm.manual_override_latched:
+                self.set_return_status('MANUAL_OVERRIDE', 'LOW_BATTERY_H12_CONTROL_ACTIVE')
+                return
             if self.fsm.state == States.IDLE:
                 self.fsm.failsafe('LOW_BATTERY'); self._state_changed()
             elif self.fsm.state in self.fsm.ACTIVE and self.automatic_control_allowed('low battery RTL'):
-                if self.adapter.is_connected(): self.adapter.rtl(self.rtl_mode)
-                self.fsm.failsafe('LOW_BATTERY_RTL_REQUESTED'); self.command_feeder(False, 'LOW_BATTERY'); self._state_changed()
+                self.on_return_now(Empty())
+                if self.return_status['state'] == 'REQUESTED':
+                    self.set_return_status('REQUESTED', 'LOW_BATTERY_RETURN_REQUESTED')
+
+    def set_return_status(self, state, reason=''):
+        self.return_status.update({
+            'state': str(state), 'reason': str(reason),
+            'requested_at': (self.return_requested_at
+                             if self.return_requested_at > 0.0 else None),
+            'attempts': int(self.normal_rtl.attempts),
+        })
+        self.publish_return_status()
+
+    def publish_return_status(self):
+        self.return_status_pub.publish(String(data=json.dumps(self.return_status)))
+
+    def on_return_now(self, _msg):
+        """Fail-safe, idempotent operator command to abandon and return."""
+        if self.return_status['state'] in ('REQUESTED', 'RTL_CONFIRMED'):
+            self.publish_return_status()
+            return
+        self.command_feeder(False, 'USER_RETURN')
+        self.return_requested_at = time.time()
+        self.return_requested_monotonic = time.monotonic()
+        self.return_initial_mode = self.adapter.get_mode()
+        self.return_explicit = True
+        self.return_clear_done = False
+        if not self.adapter.is_connected():
+            self.fsm.mission_aborted = True
+            self.set_return_status('FAILED', 'FCU_DISCONNECTED_MANUAL_TAKEOVER_REQUIRED')
+            self._state_changed()
+            return
+        if not self.adapter.state.armed:
+            self.fsm.user_return(False)
+            try:
+                self.return_clear_done = bool(self.adapter.clear_mission())
+            except rospy.ServiceException:
+                self.return_clear_done = False
+            self.set_return_status('LANDED', 'TASK_CANCELLED_DISARMED')
+            self._state_changed()
+            return
+        if self.current_gps is None or time.monotonic()-self.last_gps > self.gps_timeout:
+            self.fsm.mission_aborted = True
+            self.set_return_status('FAILED', 'UAV_GPS_INVALID_MANUAL_TAKEOVER_REQUIRED')
+            self._state_changed()
+            return
+        if not self.fsm.user_return(True):
+            self.set_return_status('MANUAL_OVERRIDE', self.fsm.reason)
+            self._state_changed()
+            return
+        self.normal_rtl.reset(time.monotonic())
+        self.set_return_status('REQUESTED', 'USER_RETURN_REQUESTED')
+        self._state_changed()
 
     def on_request(self, msg):
         if not msg.start: return
@@ -175,6 +255,11 @@ class MissionFSMNode:
             self.grid_feeding_duration_sec = float(msg.feeding_dwell_sec)
             self.grid_cell_started_at = 0.0
             self.grid_cell_index = -1
+            self.return_explicit = False
+            self.return_clear_done = False
+            self.return_requested_at = 0.0
+            self.return_requested_monotonic = 0.0
+            self.set_return_status('IDLE', '')
             self._state_changed()
         else: rospy.logwarn('Mission request rejected in state %s', self.fsm.state)
 
@@ -230,9 +315,8 @@ class MissionFSMNode:
     def on_feeder_status(self, msg): self.feeder_status = msg.data
 
     def beacon_required_for_active_task(self):
-        """Photo-point missions use approved stored XY and do not require A/B."""
-        source = str(rospy.get_param('/realflight/task_source_mode', 'GPS_CENTER')).strip().upper()
-        return bool(self.require_beacon and source != 'PHOTO_POINTS')
+        """Only the immutable GROUND_GPS startup profile may require A/B."""
+        return bool(self.require_beacon and self.input_profile == 'GROUND_GPS')
 
     def on_beacon_status(self, msg):
         try:
@@ -273,9 +357,13 @@ class MissionFSMNode:
         self._update_grid_timers(now)
         if self.fsm.state in self.fsm.ACTIVE:
             if now-self.last_fcu > self.fcu_timeout:
-                self.fsm.failsafe('FCU_DISCONNECTED'); self.command_feeder(False,'FCU_DISCONNECTED'); self._state_changed()
+                self.fsm.failsafe('FCU_DISCONNECTED'); self.command_feeder(False,'FCU_DISCONNECTED')
+                if self.return_explicit: self.set_return_status('FAILED','FCU_DISCONNECTED_MANUAL_TAKEOVER_REQUIRED')
+                self._state_changed()
             elif now-self.last_gps > self.gps_timeout:
-                self.fsm.failsafe('GPS_LOST'); self.command_feeder(False,'GPS_LOST'); self._state_changed()
+                self.fsm.failsafe('GPS_LOST'); self.command_feeder(False,'GPS_LOST')
+                if self.return_explicit: self.set_return_status('FAILED','UAV_GPS_LOST_MANUAL_TAKEOVER_REQUIRED')
+                self._state_changed()
         beacon_required = self.beacon_required_for_active_task()
         if (beacon_required and self.fsm.state in (States.PLAN,States.UPLOAD_MISSION,States.WAIT_ARM) and
                 (self.last_beacon_valid <= 0.0 or
@@ -332,16 +420,32 @@ class MissionFSMNode:
             if self.fsm.confirm_auto_mode(self.adapter.state.armed and auto_entry_permission,
                                           self.adapter.get_mode(), self.auto_mode):
                 self._state_changed()
-        if self.fsm.state == States.RTL:
+        if self.fsm.state in (States.RTL, States.USER_RETURN):
             self._handle_normal_rtl(now)
-        if (self.fsm.state == States.RTL and self.normal_rtl.confirmed and
+        if (self.fsm.state in (States.RTL, States.USER_RETURN) and
+                self.normal_rtl.confirmed and
                 self.adapter.relative_alt is not None and self.adapter.relative_alt <= 0.5):
             self.fsm.landed(); self._state_changed()
         if self.fsm.state == States.LAND and not self.adapter.state.armed:
             self.fsm.landed(); self._state_changed()
+        if (self.return_explicit and not self.adapter.state.armed and
+                self.fsm.state in (States.LAND, States.FINISHED) and
+                not self.return_clear_done):
+            try:
+                self.return_clear_done = bool(self.adapter.clear_mission())
+            except rospy.ServiceException:
+                self.return_clear_done = False
+            self.set_return_status(
+                'LANDED',
+                'RETURN_COMPLETE_MISSION_CLEARED' if self.return_clear_done
+                else 'RETURN_COMPLETE_MISSION_CLEAR_FAILED')
         limit = self.timeouts.get(self.fsm.state)
         if limit and now-self.state_since > limit:
-            if self.fsm.state in (States.TAKEOFF, States.TRANSIT, States.FEEDING, States.EXIT, States.RTL, States.LAND):
+            if self.fsm.state in (States.TAKEOFF, States.TRANSIT, States.FEEDING,
+                                  States.EXIT, States.RTL, States.USER_RETURN,
+                                  States.LAND):
+                if self.return_explicit:
+                    self.set_return_status('FAILED', self.fsm.state+'_TIMEOUT')
                 self.fsm.timeout_abort(self.fsm.state+'_TIMEOUT'); self._enter_timeout_abort(now); self._state_changed()
             else:
                 self.fsm.failsafe(self.fsm.state+'_TIMEOUT'); self.command_feeder(False,'MISSION_TIMEOUT'); self._state_changed()
@@ -533,11 +637,24 @@ class MissionFSMNode:
                 self.normal_rtl.attempts, 'ACCEPTED' if accepted else 'REJECTED')
             rospy.logwarn('RTL request %d/%d: mode=%s service_accepted=%s; waiting for FC mode confirmation',
                           self.normal_rtl.attempts, self.rtl_retries, self.rtl_mode, accepted)
-        elif action == RtlRequestController.CONFIRMED and self.fsm.reason != 'RTL_MODE_CONFIRMED':
-            self.fsm.reason = 'RTL_MODE_CONFIRMED'
+            if self.return_explicit:
+                self.set_return_status(
+                    'REQUESTED',
+                    'RTL_REQUEST_{}_{}'.format(
+                        self.normal_rtl.attempts,
+                        'ACCEPTED' if accepted else 'REJECTED'))
+        elif (action == RtlRequestController.CONFIRMED and
+              self.fsm.reason not in ('RTL_MODE_CONFIRMED',
+                                      'USER_RETURN_RTL_CONFIRMED')):
+            self.fsm.reason = ('USER_RETURN_RTL_CONFIRMED'
+                               if self.return_explicit else 'RTL_MODE_CONFIRMED')
             rospy.loginfo('RTL confirmed by /mavros/state: %s', self.rtl_mode)
+            if self.return_explicit:
+                self.set_return_status('RTL_CONFIRMED', 'FCU_MODE_AUTO_RTL')
         elif action == RtlRequestController.FAILED:
             self.fsm.transition(States.ERROR, 'RTL_MODE_NOT_CONFIRMED_AFTER_{}_ATTEMPTS'.format(self.rtl_retries))
+            if self.return_explicit:
+                self.set_return_status('FAILED', self.fsm.reason)
             self._state_changed()
 
     def _handle_timeout_recovery(self, now):
@@ -588,7 +705,7 @@ class MissionFSMNode:
 
     def _state_changed(self):
         if self.fsm.state != self.last_state:
-            if self.fsm.state == States.RTL:
+            if self.fsm.state in (States.RTL, States.USER_RETURN):
                 self.normal_rtl.reset(time.monotonic())
                 self.rtl_attempted = False
             rospy.loginfo('FSM %s -> %s (%s)', self.last_state, self.fsm.state, self.fsm.reason)

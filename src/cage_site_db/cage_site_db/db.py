@@ -1,6 +1,7 @@
 import contextlib
 import datetime as dt
 import json
+import os
 import sqlite3
 import uuid
 
@@ -25,8 +26,21 @@ def connect():
 
 def init_db():
     config.ensure_dirs()
-    with connect() as conn, open(config.SCHEMA_PATH, encoding="utf-8") as handle:
-        conn.executescript(handle.read())
+    existed = os.path.isfile(config.DB_PATH) and os.path.getsize(config.DB_PATH) > 0
+    with connect() as conn:
+        existed = bool(existed and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='subcages'").fetchone())
+        if existed:
+            from .migrations import backup_before_migration, migrate
+            pending, _ = backup_before_migration(conn)
+            migrate(conn, pending)
+        else:
+            pending = None
+        with open(config.SCHEMA_PATH, encoding="utf-8") as handle:
+            conn.executescript(handle.read())
+        if not existed:
+            from .migrations import migrate
+            migrate(conn, pending)
 
 
 @contextlib.contextmanager

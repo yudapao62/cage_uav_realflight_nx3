@@ -5,6 +5,25 @@ message to the shared grid, feeding task, planner, FSM and MAVROS adapter code.
 It does not launch Gazebo, SITL, demo missions, simulation acceptance or the
 feeder simulator. The simulation launch and configuration remain separate.
 
+## Locked startup profiles
+
+The always-on Web supervisor requires one explicit choice before the ROS core
+starts. `GROUND_GPS` keeps the external A/B receiver and its geometry chain.
+`PHOTO_COORDS` skips `/dev/ttyUSB1`, the A/B receiver and beacon geometry, and
+uses only reviewed photo/manual WGS84 points from the cage database. Both modes
+still require the FCU's onboard GPS, battery telemetry, RC/H12 and MAVROS.
+
+The equivalent direct commands are:
+
+```bash
+rosrun cage_realflight start_realflight_stack.sh --input-profile ground_gps --feeding true --rviz true --web true
+rosrun cage_realflight start_realflight_stack.sh --input-profile photo_coords --feeding true --rviz false --web true
+```
+
+The profile is immutable until the disarmed vehicle stack is stopped. See
+`PHOTO_COORDS_WEB_WORKFLOW.md` for the database, frozen-preview, battery and
+global RETURN workflow.
+
 ## Current site blockers
 
 On `nx3`, the GPS workspace provides the verified interface:

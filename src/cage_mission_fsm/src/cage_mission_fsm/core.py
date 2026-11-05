@@ -2,7 +2,7 @@
 class States:
     INIT='INIT'; WAIT_FCU='WAIT_FCU'; WAIT_GPS='WAIT_GPS'; IDLE='IDLE'; PLAN='PLAN'
     UPLOAD_MISSION='UPLOAD_MISSION'; WAIT_ARM='WAIT_ARM'; TAKEOFF='TAKEOFF'
-    TRANSIT='TRANSIT'; FEEDING='FEEDING'; FEEDING_DWELL='FEEDING_DWELL'; EXIT='EXIT'; RTL='RTL'; LAND='LAND'
+    TRANSIT='TRANSIT'; FEEDING='FEEDING'; FEEDING_DWELL='FEEDING_DWELL'; EXIT='EXIT'; RTL='RTL'; USER_RETURN='USER_RETURN'; LAND='LAND'
     FINISHED='FINISHED'; MANUAL_OVERRIDE='MANUAL_OVERRIDE'; FAILSAFE='FAILSAFE'; ERROR='ERROR'
     TIMEOUT_ABORT='TIMEOUT_ABORT'; RECOVERY_RTL='RECOVERY_RTL'; RECOVERY_RTL_VERIFY='RECOVERY_RTL_VERIFY'
     RECOVERY_RETURNING='RECOVERY_RETURNING'; RECOVERY_LANDING='RECOVERY_LANDING'; RECOVERY_LANDED='RECOVERY_LANDED'
@@ -41,7 +41,8 @@ class RtlRequestController:
 
 class MissionFSM:
     ACTIVE = {States.UPLOAD_MISSION, States.WAIT_ARM, States.TAKEOFF, States.TRANSIT,
-              States.FEEDING, States.FEEDING_DWELL, States.EXIT, States.RTL, States.LAND}
+              States.FEEDING, States.FEEDING_DWELL, States.EXIT, States.RTL,
+              States.USER_RETURN, States.LAND}
     CONTROLLED = ACTIVE | {States.TIMEOUT_ABORT, States.RECOVERY_RTL, States.RECOVERY_RTL_VERIFY,
                             States.RECOVERY_RETURNING, States.RECOVERY_LANDING}
     NON_TAKEOVER_STATES = {States.INIT, States.WAIT_FCU, States.WAIT_GPS, States.IDLE}
@@ -145,8 +146,28 @@ class MissionFSM:
         self.transition(States.RTL if self.rtl_after_mission else States.FINISHED,
                         'GRID_FINAL_CELL_DWELL_COMPLETE')
         return True
+    def user_return(self, armed):
+        """Abandon every pending task and enter the explicit return chain.
+
+        A latched H12 takeover is never cleared here: the pilot remains the
+        highest-priority controller and the Web request is reported as unable
+        to override manual control.
+        """
+        self.feeder_enabled = False
+        self.mission_aborted = True
+        self.recovery_active = False
+        self.current_cell_id = ''
+        if self.manual_override_latched:
+            self.reason = 'USER_RETURN_BLOCKED_BY_MANUAL_OVERRIDE'
+            return False
+        if not armed:
+            self.transition(States.FINISHED, 'USER_RETURN_CANCELLED_DISARMED')
+            return True
+        self.auto_control_started = True
+        self.transition(States.USER_RETURN, 'USER_RETURN_REQUESTED')
+        return True
     def landed(self):
-        if self.state == States.RTL: self.transition(States.LAND)
+        if self.state in (States.RTL, States.USER_RETURN): self.transition(States.LAND)
         elif self.state == States.LAND: self.transition(States.FINISHED)
     def timeout_abort(self, reason):
         if self.state not in self.ACTIVE or not self.automatic_control_allowed(): return
