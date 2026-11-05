@@ -1,6 +1,6 @@
 # 无双地面 GPS 的照片/坐标实飞与多网箱数据库改造方案
 
-版本：V1.0  
+版本：V1.1
 日期：2026-11-05  
 目标仓库：`yudapao62/cage_uav_realflight_nx3`  
 状态：待确认，确认后严格按本文实施
@@ -97,6 +97,7 @@
 
 - `FCU` 已连接；
 - 飞控自身 `UAV_GPS` 有效且新鲜；
+- `/mavros/battery` 电量遥测可读取；若飞控不提供百分比，网页必须明确显示“未知”，不得用 0% 或假数据代替；
 - H12/RC 输入有效；
 - 起飞前模式为 `POSCTL` 或 `ALTCTL`；
 - `auto_arm=false`；
@@ -261,6 +262,36 @@ HOME → TAKEOFF → TRANSIT → CELL_TARGET → AUTO.RTL
 
 H12 切入 `AUTO.MISSION` 仍由飞手手动完成，程序不自动切入任务模式；自动返航请求保持程序控制。
 
+### 8.4 全局 RETURN / 立即返航
+
+实飞控制网页顶部增加始终可见的 `RETURN / 立即返航` 按钮。该按钮不依赖任务是否已经预览、上传、开始或正在投喂，也不受地面 GPS、数据库、rosbag、航点完成度和普通 `start_blockers` 限制。
+
+飞机已解锁时按下 RETURN，必须按以下顺序执行：
+
+1. 立即发送投喂器关闭命令；
+2. 将本次任务标记为人工放弃，禁止继续执行剩余航点和禁止自动恢复；
+3. FSM 进入独立的 `USER_RETURN`/返航请求状态；
+4. 请求飞控切换 `AUTO.RTL`；
+5. 读取 `/mavros/state` 确认飞控确实进入 `AUTO.RTL`；
+6. 在网页持续显示“请求中、已确认、被手控接管、请求失败”之一；
+7. 飞机落地并解除锁定后再清除飞控残留任务。
+
+RETURN 必须是幂等操作：重复点击不能创建多份任务、不能重新打开投喂器，也不能破坏已经确认的 RTL。
+
+飞机未解锁时按下 RETURN：关闭投喂器、取消和作废待执行任务、清除允许起飞提示，不发送无意义的飞行模式命令。
+
+FCU 断连或飞控 GPS 无效时，系统无法保证自动返航。网页必须立即显示明确失败原因并提示飞手手动接管，禁止显示“返航成功”。
+
+控制优先级固定为：
+
+```text
+H12 手动接管 > 网页 RETURN > 普通自动任务
+```
+
+网页 RETURN 可以主动打断普通任务并请求 RTL；但飞手随后通过 H12 切回 `POSCTL`、`ALTCTL` 或其他手控模式时，视为最高优先级接管。程序必须立即停止重复发送 RTL/任务模式请求、保持投喂器关闭，并锁定为 `MANUAL_OVERRIDE`，不得与飞手抢夺模式控制权。
+
+普通“取消任务”与 RETURN 含义不同：取消按钮只取消未起飞任务；飞机已解锁或任务已运行时，网页必须引导使用 RETURN 或 H12 接管。
+
 ## 9. 多大网箱数据库
 
 现有 `sites` 表继续保留，业务含义和网页名称统一改为“**大网箱**”，避免破坏已有数据库。
@@ -313,6 +344,7 @@ H12 切入 `AUTO.MISSION` 仍由飞手手动完成，程序不自动切入任务
 - 投喂时间、停留时间、速度、接受半径；
 - 预览哈希；
 - 提交、上传校验、开始、完成、RTL 和失败状态；
+- 用户按下 RETURN 的时间、当时模式、电量、位置、RTL 请求次数、确认结果和是否被 H12 接管；
 - 创建和更新时间。
 
 任务提交后即使数据库坐标后来更新，本次任务仍使用已经人工确认的冻结版本。
@@ -369,6 +401,21 @@ H12 切入 `AUTO.MISSION` 仍由飞手手动完成，程序不自动切入任务
 - RViz 风格 XY/Z 向上的航点预览；
 - 当前航点、完成数量、投喂状态和 RTL 状态。
 
+页面顶部固定状态栏必须始终显示：
+
+- 电池剩余百分比；
+- 总电压；
+- 数据更新时间/是否过期；
+- 低电量告警；
+- FCU 连接、解锁状态和当前飞行模式；
+- 常驻的 `RETURN / 立即返航` 按钮。
+
+电量来自 `/mavros/battery`，不能根据电压自行伪造百分比。`percentage` 有效时显示 0～100%；无效时显示“未知”和实际电压。超过配置的遥测超时时间后显示“电量数据过期”。
+
+保留现有低电量保护：低于 `/safety/low_battery_threshold`（默认 20%）且自动任务正在运行时，关闭投喂器并请求 RTL。若 H12 已接管，则只告警和保持投喂器关闭，不覆盖飞手模式。
+
+RETURN 按钮必须在桌面和手机宽度下都固定可见。点击后立即执行，不因普通表单校验或页面局部错误失效；页面同时用醒目颜色显示返航确认状态。
+
 不允许在 `PHOTO_COORDS` 页面选择双 GPS 任务，也不允许在 `GROUND_GPS` 页面通过切换任务来源绕过 A/B 自检。
 
 ## 11. 接口变更
@@ -391,9 +438,30 @@ GET  /api/site-db/subcages/{id}/point-versions
 POST /api/preview
 POST /api/realflight/confirm-preview
 POST /api/start
+POST /api/realflight/return-now
 ```
 
 `/api/supervisor/start` 必须携带输入模式。`/api/preview` 和 `/api/start` 必须检查任务来源与已锁定输入模式一致。
+
+`POST /api/realflight/return-now` 不需要任务参数，返回当前返航请求状态。它必须独立于 `/api/start` 的门控，并在 FCU 已连接时可打断所有普通任务。`GET /api/status` 增加：
+
+```json
+{
+  "battery": {
+    "percentage": 0.68,
+    "voltage": 47.6,
+    "fresh": true,
+    "age_sec": 0.3,
+    "low": false
+  },
+  "return_control": {
+    "state": "IDLE|REQUESTED|RTL_CONFIRMED|MANUAL_OVERRIDE|FAILED|LANDED",
+    "reason": "",
+    "requested_at": null,
+    "attempts": 0
+  }
+}
+```
 
 移除对外可用的：
 
@@ -416,6 +484,8 @@ GET  /api/site-db/tracks/*
 - `src/cage_web_bridge/scripts/web_bridge_node.py`
 - `src/cage_web_bridge/scripts/mission_modes.py`
 - `src/cage_web_bridge/www/index.html`
+- `src/cage_mission_fsm/scripts/mission_fsm_node.py`
+- `src/cage_mission_fsm/src/cage_mission_fsm/core.py`
 - `src/cage_site_db/config/schema.sql`
 - `src/cage_site_db/cage_site_db/db.py`
 - `src/cage_site_db/cage_site_db/service.py`
@@ -442,6 +512,13 @@ GET  /api/site-db/tracks/*
 - 冻结 HOME 和冻结坐标版本；
 - 投喂时间必须小于停留时间；
 - 最后目标完成进入 RTL；
+- 任意任务阶段按 RETURN 都先关闭投喂器、作废剩余任务并请求 RTL；
+- RETURN 重复点击幂等；
+- RETURN 后 H12 接管会立即停止 RTL 重试，且程序不再抢模式；
+- 未解锁时 RETURN 只取消任务和关闭投喂，不发送飞行模式；
+- FCU 断连、GPS 无效或 RTL 被拒绝时网页显示真实失败状态；
+- 电池百分比、电压、数据新鲜度和低电量状态转换；
+- 电池百分比未知时不显示伪造数值；
 - 不生成重复 `GRID_EXIT`；
 - 跨大网箱选择被拒绝；
 - 模式与任务来源不一致被拒绝；
@@ -465,6 +542,10 @@ GET  /api/site-db/tracks/*
 12. 最后目标完成后确认 `AUTO.RTL`；
 13. rosbag 包含完整状态、航点、投喂和模式变化。
 
+另做中途返航测试：分别在等待解锁、起飞、过渡飞行、目标投喂和多点任务中途按 RETURN，验证投喂器关闭、剩余任务放弃、RTL 被确认；RTL 后再用 H12 切回手控，验证程序立即停止 RTL 重试且不与飞手争夺控制权。
+
+录包同时验证 `/mavros/battery` 与网页显示一致，断开/停止电量消息后网页能够显示数据过期。
+
 同时回归 `GROUND_GPS` 模式，确保原来的双 GPS 中点和 A/B 网格功能没有被破坏。
 
 ## 14. 完成验收标准
@@ -480,6 +561,10 @@ GET  /api/site-db/tracks/*
 - 照片 Z 被忽略，航点 Z 使用网页参数；
 - 支持多个大网箱，每个大网箱至少 200 个小网箱；
 - 单点和多点任务均从当前 HOME 起飞并最终请求 RTL；
+- 网页始终显示真实电量百分比/电压及数据新鲜度；
+- 任何普通任务阶段均可通过 RETURN 放弃任务并请求返航；
+- RETURN 的结果必须以飞控模式回读确认，不能只根据接口调用成功判定；
+- H12 手动接管始终高于网页 RETURN 和所有自动任务，程序不得反复覆盖飞手模式；
 - 预览确认后提交使用冻结计划；
 - 上传飞控前清任务，上传后校验数量；
 - 自动解锁仍为关闭；
@@ -497,8 +582,9 @@ GET  /api/site-db/tracks/*
 4. 改造初始化页和启动脚本的输入模式选择；
 5. 改造 ROS launch 和自检条件；
 6. 改造数据库点任务规划和冻结提交；
-7. 改造网页任务选择、地图和进度显示；
-8. 补齐单元与集成测试；
-9. 在本地完成静态检查；
-10. 提交并推送 GitHub；
-11. 经确认后再 SSH 到 NX3 部署，不在本文确认前修改 NX3 运行环境。
+7. 增加电量状态和全局 RETURN/手控优先级链路；
+8. 改造网页任务选择、地图、固定电量栏、RETURN 和进度显示；
+9. 补齐单元与集成测试；
+10. 在本地完成静态检查；
+11. 提交并推送 GitHub；
+12. 经确认后再 SSH 到 NX3 部署，不在本文确认前修改 NX3 运行环境。
