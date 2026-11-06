@@ -90,7 +90,8 @@ class FrozenSubmissionTest(unittest.TestCase):
             now.return_value.to_sec.return_value = 1.0
             with self.assertRaisesRegex(ValueError, 'duplicate photo assets'):
                 bridge.normalized_payload({'task_source': 'PHOTO_POINTS',
-                    'photo_asset_ids': ['asset-1', 'asset-1']})
+                    'photo_asset_ids': ['asset-1', 'asset-1'],
+                    'feeding_dwell_sec': 5.0, 'waypoint_hold_sec': 10.0})
 
 
 if __name__ == '__main__':
