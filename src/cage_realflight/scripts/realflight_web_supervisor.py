@@ -142,7 +142,7 @@ SUPERVISOR_PAGE = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-
 <body><main><div class="box"><h1>CAGE UAV 实飞系统</h1><p id="state">读取状态…</p>
 <h2>初始化前选择坐标来源</h2><div class="profiles">
 <label class="profile"><input type="radio" name="profile" value="GROUND_GPS"><b>双地面 GPS A/B</b><p class="muted">启动 /dev/ttyUSB1、GPS接收机、A/B几何和中点/对角网格任务。</p></label>
-<label class="profile"><input type="radio" name="profile" value="PHOTO_COORDS"><b>照片/人工坐标（无地面GPS）</b><p class="muted">不检查 /dev/ttyUSB1，不启动A/B；使用照片EXIF或已审核人工经纬度。</p></label>
+<label class="profile"><input type="radio" name="profile" value="PHOTO_COORDS"><b>快速照片 GPS（无地面GPS）</b><p class="muted">不检查 /dev/ttyUSB1，不启动A/B；上传带 GPS 的 JPG 后直接生成轨迹。</p></label>
 </div><label><input id="feeding" type="checkbox" checked> 启用真实投喂器</label>　<label><input id="rviz" type="checkbox"> 启动RViz</label>
 <p><button id="start" onclick="go()" disabled>启动所选实飞系统</button>　<a href="/site-db/">网箱坐标数据库</a></p>
 <p class="muted">每次停止系统后必须重新选择。飞控自身GPS在两种模式下都必须有效。</p><pre id="log"></pre></div></main>
@@ -167,7 +167,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req = urllib.request.Request(base+self.path, data=raw, method=method,
                                          headers={'Content-Type': self.headers.get('Content-Type', 'application/json')})
-            with urllib.request.urlopen(req, timeout=30) as response:
+            timeout = 300 if self.path == '/api/site-db/imports/photos' else 30
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 self.reply(response.status, response.headers.get('Content-Type', 'application/octet-stream'), response.read())
         except urllib.error.HTTPError as exc:
             self.reply(exc.code, exc.headers.get('Content-Type', 'application/json'), exc.read())

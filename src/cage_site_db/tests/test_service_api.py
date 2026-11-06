@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer
 
 os.environ.setdefault('CAGE_SITE_DB_DATA', tempfile.mkdtemp(prefix='cage_site_api_test_'))
 
-from cage_site_db.db import init_db, row, transaction
+from cage_site_db.db import dump, init_db, now, row, transaction
 from cage_site_db.service import Handler
 
 
@@ -68,6 +68,42 @@ class ServiceApiTest(unittest.TestCase):
             saved = row(conn.execute("SELECT state,home_lat FROM mission_snapshots WHERE mission_id='api-mission'"))
         self.assertEqual('RTL_CONFIRMED', saved['state'])
         self.assertAlmostEqual(27.57, saved['home_lat'])
+
+    def test_quick_photo_points_and_snapshot_asset_link(self):
+        asset_id = 'asset_quick_api'
+        with transaction() as conn:
+            conn.execute("""INSERT INTO source_assets
+                (id,sha256,kind,original_name,original_path,source_role,byte_size,
+                 mime_type,parser,import_status,metadata_json,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (asset_id, 'a'*64, 'JPG', 'DJI_0007.JPG', '/tmp/immutable.jpg',
+                 'QUICK_MISSION_WEB', 1234, 'image/jpeg', 'ExifTool', 'SUCCESS',
+                 dump({}), now()))
+            conn.execute("""INSERT INTO gps_samples
+                (id,source_asset_id,sample_index,latitude,longitude,altitude_m,
+                 gps_valid,origin_type,quality_flags,metadata_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                ('sample_quick_api', asset_id, 0, 27.5824, 120.5663, 99.0,
+                 1, 'PHOTO_EXIF', dump(['GPS_PRESENT']), dump({})))
+        points = self.get('/quick-photo-points?asset_id='+asset_id)['points']
+        self.assertEqual(1, len(points))
+        self.assertEqual(asset_id, points[0]['asset_id'])
+        self.assertTrue(points[0]['photo_altitude_ignored'])
+        params = {'takeoff_relative_alt': 10.0, 'transit_relative_alt': 8.0,
+                  'feed_relative_alt': 5.0, 'feeding_dwell_sec': 5.0,
+                  'waypoint_hold_sec': 10.0, 'speed': 5.0,
+                  'acceptance_radius': 3.0}
+        self.post('/mission-snapshots', {'mission_id': 'quick-photo-mission',
+            'input_profile': 'PHOTO_COORDS', 'site_id': None,
+            'home': {'lat': 27.57, 'lon': 120.55, 'alt': 12.0},
+            'parameters': params, 'preview_hash': 'quick-hash',
+            'targets': [{'source_asset_id': asset_id, 'label': 'DJI_0007.JPG',
+                         'lat': 27.5824, 'lon': 120.5663}]})
+        with transaction() as conn:
+            saved = row(conn.execute("""SELECT source_asset_id,label
+                FROM mission_snapshot_targets WHERE source_asset_id=?""", (asset_id,)))
+        self.assertEqual(asset_id, saved['source_asset_id'])
+        self.assertEqual('DJI_0007.JPG', saved['label'])
 
 
 if __name__ == '__main__': unittest.main(verbosity=2)

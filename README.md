@@ -11,6 +11,7 @@
 - 初始化前强制选择 `GROUND_GPS`（双地面 GPS A/B）或 `PHOTO_COORDS`（照片/人工坐标）；
 - 多大网箱数据库，每个大网箱支持 1～200 个小网箱、照片 EXIF、人工经纬度、坐标 CSV 和审核版本；
 - 照片/人工坐标只采用经纬度，高度由网页参数设置；
+- 快速照片任务可直接上传带 EXIF GPS 的 JPG，自动生成最近邻或人工顺序轨迹；
 - 网页完成启动、自检、现场确认、预览、提交、录包和停止系统；
 - H12 手动切换 `AUTO.MISSION`，CH5/E 右侧门控；
 - PWM9 投喂器定时开关；
@@ -77,6 +78,7 @@ catkin_test_results build/test_results
 详细流程见：
 
 - `src/cage_realflight/PHOTO_COORDS_WEB_WORKFLOW.md`
+- `src/cage_realflight/QUICK_PHOTO_MISSION_WORKFLOW.md`
 - `src/cage_realflight/WEB_FULL_SYSTEM_TEST.md`
 - `src/cage_realflight/THREE_MODE_WEB_TASKS_2026-10-30.md`
 - `src/cage_realflight/REALFLIGHT_EXPERIMENT_QUICKSTART.md`

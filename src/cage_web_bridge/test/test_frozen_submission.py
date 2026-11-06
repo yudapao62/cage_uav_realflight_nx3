@@ -67,6 +67,31 @@ class FrozenSubmissionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'INPUT_PROFILE_TASK_SOURCE_MISMATCH'):
                 bridge.normalized_payload({'task_source': 'GPS_GRID'})
 
+    def test_quick_photo_assets_do_not_require_large_cage(self):
+        bridge = object.__new__(WebBridge)
+        bridge.input_profile = 'PHOTO_COORDS'
+        payload = {'task_id': 'quick-photo', 'task_source': 'PHOTO_POINTS',
+                   'photo_asset_ids': ['asset-1', 'asset-2'],
+                   'feeding_dwell_sec': 5.0, 'waypoint_hold_sec': 10.0}
+        with mock.patch('web_bridge_node.rospy.Time.now') as now, \
+                mock.patch('web_bridge_node.rospy.get_param',
+                           side_effect=lambda _name, default: default):
+            now.return_value.to_sec.return_value = 1.0
+            result = bridge.normalized_payload(payload)
+        self.assertEqual(['asset-1', 'asset-2'], result['photo_asset_ids'])
+        self.assertEqual('', result['large_cage_id'])
+
+    def test_quick_photo_duplicate_asset_is_rejected(self):
+        bridge = object.__new__(WebBridge)
+        bridge.input_profile = 'PHOTO_COORDS'
+        with mock.patch('web_bridge_node.rospy.Time.now') as now, \
+                mock.patch('web_bridge_node.rospy.get_param',
+                           side_effect=lambda _name, default: default):
+            now.return_value.to_sec.return_value = 1.0
+            with self.assertRaisesRegex(ValueError, 'duplicate photo assets'):
+                bridge.normalized_payload({'task_source': 'PHOTO_POINTS',
+                    'photo_asset_ids': ['asset-1', 'asset-1']})
+
 
 if __name__ == '__main__':
     unittest.main()

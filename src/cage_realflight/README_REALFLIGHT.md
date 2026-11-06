@@ -10,7 +10,7 @@ feeder simulator. The simulation launch and configuration remain separate.
 The always-on Web supervisor requires one explicit choice before the ROS core
 starts. `GROUND_GPS` keeps the external A/B receiver and its geometry chain.
 `PHOTO_COORDS` skips `/dev/ttyUSB1`, the A/B receiver and beacon geometry, and
-uses only reviewed photo/manual WGS84 points from the cage database. Both modes
+uses direct EXIF photo XY points or reviewed database points. Both modes
 still require the FCU's onboard GPS, battery telemetry, RC/H12 and MAVROS.
 
 The equivalent direct commands are:
@@ -21,8 +21,9 @@ rosrun cage_realflight start_realflight_stack.sh --input-profile photo_coords --
 ```
 
 The profile is immutable until the disarmed vehicle stack is stopped. See
-`PHOTO_COORDS_WEB_WORKFLOW.md` for the database, frozen-preview, battery and
-global RETURN workflow.
+`QUICK_PHOTO_MISSION_WORKFLOW.md` for the default upload-to-route flow, and
+`PHOTO_COORDS_WEB_WORKFLOW.md` for database, frozen-preview, battery and global
+RETURN details.
 
 ## Current site blockers
 

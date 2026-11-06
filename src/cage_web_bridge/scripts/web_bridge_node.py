@@ -294,6 +294,7 @@ class WebBridge:
             'waypoint_hold_sec': rospy.get_param('/mission/grid_waypoint_hold_sec', 10.0),
             'grid_rows': 6, 'grid_cols': 10, 'large_cage_id': '',
             'route_order_mode': 'NEAREST', 'photo_point_ids': [],
+            'photo_asset_ids': [],
             'speed': rospy.get_param('/mission/speed', 5.0),
             'acceptance_radius': rospy.get_param('/mission/waypoint_acceptance_radius', 3.0),
             'max_leg_distance': rospy.get_param('/safety/max_leg_distance', 5000.0)}
@@ -334,13 +335,25 @@ class WebBridge:
         if not isinstance(ids, list):
             raise ValueError('photo_point_ids must be a list')
         out['photo_point_ids'] = [str(value) for value in ids]
+        asset_ids = out.get('photo_asset_ids', [])
+        if not isinstance(asset_ids, list):
+            raise ValueError('photo_asset_ids must be a list')
+        out['photo_asset_ids'] = [str(value) for value in asset_ids if str(value)]
+        if len(out['photo_asset_ids']) > 200:
+            raise ValueError('photo target count must be 1..200')
+        if len(set(out['photo_asset_ids'])) != len(out['photo_asset_ids']):
+            raise ValueError('duplicate photo assets are not allowed')
         out['large_cage_id'] = str(out.get('large_cage_id') or '')
         out['route_order_mode'] = str(out.get('route_order_mode') or 'NEAREST').upper()
         if out['route_order_mode'] not in ('NEAREST','MANUAL'):
             raise ValueError('route_order_mode must be NEAREST or MANUAL')
         if out['task_source'] == 'PHOTO_POINTS':
-            if not out['large_cage_id']: raise ValueError('select one large cage')
-            if not out['photo_point_ids']: raise ValueError('select at least one approved database point')
+            quick = bool(out['photo_asset_ids'])
+            advanced = bool(out['photo_point_ids'])
+            if quick == advanced:
+                raise ValueError('select quick photos or approved database points')
+            if advanced and not out['large_cage_id']:
+                raise ValueError('select one large cage')
         return out
 
     def make_request(self, payload, auto_start):
@@ -391,30 +404,56 @@ class WebBridge:
             rospy.logwarn_throttle(10.0, 'Photo point database unavailable: %s', exc)
             return []
 
+    def quick_photo_points(self, asset_ids):
+        try:
+            query = urllib.parse.urlencode([('asset_id', value) for value in asset_ids])
+            data = self._json_url(
+                'http://127.0.0.1:8090/api/site-db/quick-photo-points?'+query)
+            return [{'id': str(point['asset_id']),
+                     'asset_id': str(point['asset_id']),
+                     'label': str(point.get('label') or point.get('original_name') or point['asset_id']),
+                     'lat': float(point['lat']), 'lon': float(point['lon']),
+                     'original_timestamp': point.get('original_timestamp'),
+                     'quality_flags': point.get('quality_flags', [])}
+                    for point in data.get('points', [])]
+        except Exception as exc:
+            rospy.logwarn('Quick photo database unavailable: %s', exc)
+            return []
+
     def save_snapshot(self):
         if self.input_profile != 'PHOTO_COORDS':
             return None
         data = self.frozen_preview_payload
-        points = {item['id']: item for item in self.approved_photo_points()}
-        execution_ids = [item['approved_version_id'] for item in self.preview_details.get('order', [])]
+        quick = bool(data.get('photo_asset_ids'))
+        points = ({item['id']: item for item in self.quick_photo_points(data['photo_asset_ids'])}
+                  if quick else {item['id']: item for item in self.approved_photo_points()})
+        execution_ids = [item.get('source_asset_id') if quick else item.get('approved_version_id')
+                         for item in self.preview_details.get('order', [])]
         selected = [points[item] for item in execution_ids if item in points]
-        if len(selected) != len(data['photo_point_ids']):
-            raise ValueError('APPROVED_POINT_VERSION_CHANGED')
+        expected = len(data['photo_asset_ids'] if quick else data['photo_point_ids'])
+        if len(selected) != expected:
+            raise ValueError('PHOTO_SOURCE_CHANGED_OR_MISSING')
         home = self.preview_details['home']
         digest = hashlib.sha256(json.dumps({'payload': data, 'plan': self.frozen_direct_plan},
             sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest()
         return self._post_json('http://127.0.0.1:8090/api/site-db/mission-snapshots', {
             'mission_id': data['task_id'], 'input_profile': self.input_profile,
-            'site_id': data['large_cage_id'],
+            'site_id': data['large_cage_id'] or None,
             'home': home,
             'parameters': data, 'preview_hash': digest, 'state': 'PREVIEW_CONFIRMED',
             'details': self.preview_details,
-            'targets': [{'subcage_id': point['subcage_id'], 'approved_version_id': point['id'],
+            'targets': [{'subcage_id': None if quick else point['subcage_id'],
+                         'approved_version_id': None if quick else point['id'],
+                         'source_asset_id': point['asset_id'] if quick else None,
                          'label': point['label'], 'lat': point['lat'], 'lon': point['lon']}
                         for point in selected]})
 
     def verify_frozen_versions(self):
         if self.input_profile != 'PHOTO_COORDS': return True
+        if self.frozen_preview_payload.get('photo_asset_ids'):
+            current = {item['id'] for item in self.quick_photo_points(
+                self.frozen_preview_payload['photo_asset_ids'])}
+            return current == set(self.frozen_preview_payload['photo_asset_ids'])
         current = {item['id']: item for item in self.approved_photo_points()}
         return all(point_id in current and current[point_id]['site_id'] == self.frozen_preview_payload['large_cage_id']
                    for point_id in self.frozen_preview_payload['photo_point_ids'])
@@ -450,17 +489,26 @@ class WebBridge:
                 (self.geometry.endpoint_b_lat, self.geometry.endpoint_b_lon, self.geometry.endpoint_b_alt),
                 data['grid_rows'], data['grid_cols'], *common)
         elif data['task_source'] == 'PHOTO_POINTS':
-            approved = {point['id']: point for point in self.approved_photo_points()
-                        if point['site_id'] == data['large_cage_id']}
-            missing = [point_id for point_id in data['photo_point_ids'] if point_id not in approved]
+            quick = bool(data['photo_asset_ids'])
+            source_ids = data['photo_asset_ids'] if quick else data['photo_point_ids']
+            available = ({point['id']: point for point in self.quick_photo_points(source_ids)}
+                         if quick else
+                         {point['id']: point for point in self.approved_photo_points()
+                          if point['site_id'] == data['large_cage_id']})
+            missing = [point_id for point_id in source_ids if point_id not in available]
             if missing:
-                raise ValueError('APPROVED_PHOTO_POINTS_REQUIRED:'+','.join(missing))
-            selected = [approved[point_id] for point_id in data['photo_point_ids']]
+                raise ValueError(('PHOTO_EXIF_GPS_REQUIRED:' if quick else
+                                  'APPROVED_PHOTO_POINTS_REQUIRED:')+','.join(missing))
+            selected = [available[point_id] for point_id in source_ids]
             plan, details = plan_photo_points(home, selected, *common,
                 preserve_order=data['route_order_mode'] == 'MANUAL')
-            details['large_cage_id'] = data['large_cage_id']
-            details['selected_versions'] = [{'id': p['id'], 'subcage_id': p['subcage_id'],
-                                              'version': p['version']} for p in selected]
+            details['photo_input_mode'] = 'QUICK_UPLOAD' if quick else 'APPROVED_DATABASE'
+            details['large_cage_id'] = data['large_cage_id'] or None
+            if quick:
+                details['selected_assets'] = [p['asset_id'] for p in selected]
+            else:
+                details['selected_versions'] = [{'id': p['id'], 'subcage_id': p['subcage_id'],
+                                                  'version': p['version']} for p in selected]
         else:
             raise ValueError('direct planner only supports GPS_GRID and PHOTO_POINTS')
         if data['repeat_count'] > 1:
@@ -693,7 +741,7 @@ def handler_factory(bridge, web_root):
                         return self.send_json({'error': 'PARAMETERS_CHANGED_REPREVIEW_REQUIRED'}, 409)
                     if not bridge.verify_frozen_versions():
                         bridge.preview_confirmed = False
-                        return self.send_json({'error': 'APPROVED_POINT_VERSION_CHANGED_REPREVIEW_REQUIRED'}, 409)
+                        return self.send_json({'error': 'PHOTO_SOURCE_CHANGED_REPREVIEW_REQUIRED'}, 409)
                     blockers = bridge.start_blockers() if rospy.get_param('/web_bridge/real_flight', False) else []
                     if blockers: return self.send_json({'error': 'MISSION_START_BLOCKED', 'blockers': blockers}, 409)
                     if requested['task_source'] == 'GPS_CENTER':

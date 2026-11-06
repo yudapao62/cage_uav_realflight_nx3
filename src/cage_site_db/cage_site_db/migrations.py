@@ -31,6 +31,10 @@ MIGRATIONS = (
         )""",
         "CREATE INDEX IF NOT EXISTS idx_mission_snapshots_site ON mission_snapshots(site_id,created_at)",
     )),
+    (3, "quick_photo_snapshot_assets", (
+        "ALTER TABLE mission_snapshot_targets ADD COLUMN source_asset_id TEXT REFERENCES source_assets(id)",
+        "CREATE INDEX IF NOT EXISTS idx_mission_snapshot_targets_asset ON mission_snapshot_targets(source_asset_id)",
+    )),
 )
 
 
@@ -47,6 +51,8 @@ def pending_versions(conn):
         if version in applied:
             continue
         if version == 1 and "status" in _columns(conn, "subcages"):
+            statements = statements[1:]
+        if version == 3 and "source_asset_id" in _columns(conn, "mission_snapshot_targets"):
             statements = statements[1:]
         pending.append((version, name, statements))
     return pending

@@ -75,6 +75,16 @@ class MissionModePlannerTest(unittest.TestCase):
         self.assertTrue(details['photo_altitude_ignored'])
         self.assertEqual(details['altitude_source'], 'WEB_PARAMETER_RELATIVE_ALT')
 
+    def test_quick_photo_assets_are_carried_into_frozen_order(self):
+        local = LocalENU(*self.HOME)
+        point = local.to_wgs84(25.0, 12.0, 500.0)
+        _plan, details = plan_photo_points(self.HOME, [
+            {'asset_id': 'asset-1', 'label': 'DJI_0007.JPG',
+             'lat': point[0], 'lon': point[1]},
+        ], 10.0, 12.0, 6.0, 8.0)
+        self.assertEqual('asset-1', details['order'][0]['source_asset_id'])
+        self.assertEqual('', details['order'][0]['approved_version_id'])
+
     def test_grid_rejects_more_than_200_cells(self):
         local = LocalENU(*self.HOME)
         a = local.to_wgs84(10.0, 0.0, 0.0)

@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS mission_snapshots (
 CREATE TABLE IF NOT EXISTS mission_snapshot_targets (
   snapshot_id TEXT NOT NULL REFERENCES mission_snapshots(id), seq INTEGER NOT NULL,
   subcage_id TEXT REFERENCES subcages(id), approved_version_id TEXT,
+  source_asset_id TEXT REFERENCES source_assets(id),
   label TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
   PRIMARY KEY(snapshot_id,seq)
 );

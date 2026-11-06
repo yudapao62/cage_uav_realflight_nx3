@@ -172,20 +172,22 @@ def plan_gps_grid(home, endpoint_a, endpoint_b, rows, cols,
                      "target_count": len(targets)}
 
 
-def plan_photo_points(home, approved_points, takeoff_alt, transit_alt, feed_alt,
+def plan_photo_points(home, photo_points, takeoff_alt, transit_alt, feed_alt,
                       dwell, radius=3.0, speed=5.0,
                       max_leg_distance=5000.0, preserve_order=False):
-    """Plan approved database XY points; altitude always comes from Web parameters."""
+    """Plan immutable photo/database XY points; altitude comes from Web parameters."""
     home_coord, _ = _common(home, takeoff_alt, transit_alt, feed_alt, dwell,
                             radius, speed, max_leg_distance)
     local = LocalENU(*home_coord)
     remaining = []
-    for index, point in enumerate(approved_points):
+    for index, point in enumerate(photo_points):
         lat, lon = _coordinate(point["lat"], point["lon"], "photo_point[{}]".format(index))
         east, north, _ = local.to_enu(lat, lon, home_coord[2])
         remaining.append({"lat": lat, "lon": lon, "x": east, "y": north,
                           "cell_id": str(point.get("label") or point.get("id") or "PHOTO-{:03d}".format(index + 1)),
-                          "approved_version_id": str(point.get("id") or "")})
+                          "source_id": str(point.get("asset_id") or point.get("id") or ""),
+                          "source_asset_id": str(point.get("asset_id") or ""),
+                          "approved_version_id": str(point.get("id") or "") if not point.get("asset_id") else ""})
     ordered, x, y = [], 0.0, 0.0
     if preserve_order:
         ordered = remaining
@@ -201,7 +203,9 @@ def plan_photo_points(home, approved_points, takeoff_alt, transit_alt, feed_alt,
     mission = _grid_mission(home_coord, ordered, takeoff_alt, transit_alt,
                             feed_alt, dwell, radius, speed, max_leg_distance)
     return mission, {"target_count": len(ordered),
-                     "order": [{"approved_version_id": p["approved_version_id"],
+                     "order": [{"source_id": p["source_id"],
+                                "source_asset_id": p["source_asset_id"],
+                                "approved_version_id": p["approved_version_id"],
                                 "label": p["cell_id"], "lat": p["lat"],
                                 "lon": p["lon"]} for p in ordered],
                      "altitude_source": "WEB_PARAMETER_RELATIVE_ALT",

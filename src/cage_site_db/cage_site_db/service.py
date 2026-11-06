@@ -43,6 +43,38 @@ def _site_map():
     return {"mode": SAFETY_MODE, "photos": photos, "approved": approved, "routes": routes}
 
 
+def _quick_photo_points(asset_ids=None):
+    """Return immutable EXIF XY points suitable for the quick mission flow."""
+    asset_ids = [str(value) for value in (asset_ids or []) if str(value)]
+    if len(asset_ids) > 200:
+        raise ValueError("PHOTO_TARGET_LIMIT_200")
+    sql = """SELECT a.id AS asset_id,a.original_name,a.sha256,a.import_status,a.error_code,
+                    a.created_at,s.id AS sample_id,s.latitude AS lat,s.longitude AS lon,
+                    s.altitude_m AS photo_altitude_m,s.original_timestamp,s.timestamp_utc,
+                    s.time_quality,s.quality_flags
+             FROM source_assets a
+             JOIN gps_samples s ON s.source_asset_id=a.id
+             WHERE a.kind='JPG' AND s.origin_type='PHOTO_EXIF' AND s.gps_valid=1"""
+    params = []
+    if asset_ids:
+        sql += " AND a.id IN (%s)" % ",".join("?" for _ in asset_ids)
+        params.extend(asset_ids)
+    sql += " ORDER BY a.created_at,a.original_name"
+    with transaction() as conn:
+        data = rows(conn.execute(sql, params))
+    decoded = []
+    for item in data:
+        item["quality_flags"] = load(item.get("quality_flags"), [])
+        item["label"] = item["original_name"]
+        item["altitude_source"] = "WEB_PARAMETER_RELATIVE_ALT"
+        item["photo_altitude_ignored"] = True
+        decoded.append(item)
+    if asset_ids:
+        by_id = {item["asset_id"]: item for item in decoded}
+        decoded = [by_id[value] for value in asset_ids if value in by_id]
+    return decoded
+
+
 def _route(route_id):
     with transaction() as conn:
         route = row(conn.execute("SELECT * FROM route_previews WHERE id=?", (route_id,)))
@@ -215,6 +247,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json({"ok": True, "version": __version__, "mode": SAFETY_MODE, "flight_control_effect": False,
                                   "coordinate_sources": ["PHOTO_EXIF", "MANUAL_WGS84", "MANUAL_WGS84_CSV"]})
             if path == "/api/site-db/map": return self.json(_site_map())
+            if path == "/api/site-db/quick-photo-points":
+                asset_ids = query.get("asset_id", [])
+                return self.json({"points": _quick_photo_points(asset_ids),
+                                  "requested": asset_ids,
+                                  "altitude_source": "WEB_PARAMETER_RELATIVE_ALT",
+                                  "photo_altitude_ignored": True})
             if path == "/api/site-db/sites":
                 with transaction() as conn: return self.json(rows(conn.execute("SELECT * FROM sites ORDER BY created_at")))
             if path == "/api/site-db/subcages":
@@ -421,9 +459,12 @@ class Handler(BaseHTTPRequestHandler):
                          params["waypoint_hold_sec"],params["speed"],params["acceptance_radius"],
                          payload["preview_hash"],payload.get("state","PREVIEW_CONFIRMED"),dump(payload.get("details",{})),stamp,stamp))
                     for seq,target in enumerate(payload.get("targets",[])):
-                        conn.execute("INSERT INTO mission_snapshot_targets VALUES (?,?,?,?,?,?,?)",
-                                     (snapshot_id,seq,target.get("subcage_id"),target.get("approved_version_id"),
-                                      target.get("label",str(seq)),target["lat"],target["lon"]))
+                        conn.execute("""INSERT INTO mission_snapshot_targets
+                            (snapshot_id,seq,subcage_id,approved_version_id,source_asset_id,label,lat,lon)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                            (snapshot_id,seq,target.get("subcage_id"),target.get("approved_version_id"),
+                             target.get("source_asset_id"),target.get("label",str(seq)),
+                             target["lat"],target["lon"]))
                 return self.json({"id":snapshot_id,"mission_id":payload["mission_id"]},201)
             if path.startswith("/api/site-db/mission-snapshots/") and path.endswith("/state"):
                 mission_id=urllib.parse.unquote(path.split("/")[-2]); state=str(payload.get("state") or "")

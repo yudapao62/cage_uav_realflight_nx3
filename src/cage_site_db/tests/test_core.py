@@ -110,6 +110,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn("status", columns)
         self.assertEqual("legacy", conn.execute("SELECT id FROM track_segments").fetchone()[0])
         self.assertTrue(conn.execute("SELECT name FROM sqlite_master WHERE name='mission_snapshots'").fetchone())
+        target_columns = {item[1] for item in conn.execute(
+            "PRAGMA table_info(mission_snapshot_targets)")}
+        self.assertIn("source_asset_id", target_columns)
         conn.close()
 
     def test_sqlite_backup_integrity(self):
