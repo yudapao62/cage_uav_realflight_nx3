@@ -24,6 +24,9 @@ __pycache__/
 /data/
 /uploads/
 
+# Bench/flight experiment outputs generated on NX3
+/src/cage_realflight/experiment/results/
+
 # Editor and operating-system files
 .DS_Store
 ._*
